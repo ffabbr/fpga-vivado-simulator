@@ -1,0 +1,551 @@
+'use client';
+
+import { useReducer, useCallback, useEffect, useState, useRef, useMemo } from 'react';
+import dynamic from 'next/dynamic';
+import { toast } from 'sonner';
+import {
+  projectReducer, createDefaultProject, saveProject, loadProject,
+  generateMsgId, type ProjectFile, type ConsoleMessage,
+} from '@/lib/store';
+import { simulate, type SimulationResult } from '@/lib/verilog-simulator';
+import { parseVerilog } from '@/lib/verilog-parser';
+import { YosysClient } from '@/lib/yosys-client';
+import type { YosysNetlist } from '@/lib/gate-sim';
+import Toolbar from '@/components/layout/Toolbar';
+import EditorTabs from '@/components/layout/EditorTabs';
+import FileExplorer from '@/components/project/FileExplorer';
+import ConsolePanel from '@/components/console/ConsolePanel';
+import { Button } from '@/components/ui/button';
+import { Trash2 } from 'lucide-react';
+import WaveformViewer from '@/components/waveform/WaveformViewer';
+import {
+  ResizableHandle, ResizablePanel, ResizablePanelGroup,
+} from '@/components/ui/resizable';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ScrollArea } from '@/components/ui/scroll-area';
+
+const CodeEditor = dynamic(() => import('@/components/editor/CodeEditor'), { ssr: false });
+const Basys3Board = dynamic(() => import('@/components/board/Basys3Board'), { ssr: false });
+
+function detectLikelyTopModule(verilogFiles: ProjectFile[]): string | null {
+  const moduleNames: string[] = [];
+  const instantiatedModuleNames = new Set<string>();
+
+  for (const file of verilogFiles) {
+    const result = parseVerilog(file.content);
+    for (const mod of result.modules) {
+      moduleNames.push(mod.name);
+      for (const inst of mod.instances) {
+        instantiatedModuleNames.add(inst.moduleName);
+      }
+    }
+  }
+
+  const uniqueModuleNames = Array.from(new Set(moduleNames));
+  if (uniqueModuleNames.length === 0) return null;
+
+  const rootCandidates = uniqueModuleNames.filter(name => !instantiatedModuleNames.has(name));
+
+  // Prefer conventional top name first, then a unique root module.
+  if (rootCandidates.includes('top')) return 'top';
+  if (rootCandidates.length === 1) return rootCandidates[0];
+  if (rootCandidates.length > 1) return rootCandidates[0];
+
+  // Fallback if the design is fully recursive/unresolved.
+  if (uniqueModuleNames.includes('top')) return 'top';
+  return uniqueModuleNames[0];
+}
+
+export default function Home() {
+  const [state, dispatch] = useReducer(projectReducer, null, () => {
+    return createDefaultProject();
+  });
+
+  const [activeView, setActiveView] = useState<'editor' | 'board' | 'waveform'>('editor');
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [isSynthesizing, setIsSynthesizing] = useState(false);
+  const [simulationResult, setSimulationResult] = useState<SimulationResult | null>(null);
+  const [netlist, setNetlist] = useState<YosysNetlist | null>(null);
+  const [bottomTab, setBottomTab] = useState<'console' | 'waveform'>('console');
+  const [loaded, setLoaded] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const yosysClientRef = useRef<YosysClient | null>(null);
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    const saved = loadProject();
+    if (saved) {
+      dispatch({ type: 'LOAD_PROJECT', state: saved });
+    }
+    setLoaded(true);
+  }, []);
+
+  // Save on change
+  useEffect(() => {
+    if (loaded) {
+      saveProject(state);
+    }
+  }, [state, loaded]);
+
+  // Clean up yosys worker on unmount
+  useEffect(() => {
+    return () => {
+      yosysClientRef.current?.terminate();
+    };
+  }, []);
+
+  // Clear netlist when design context changes (sources or chosen top module)
+  const verilogContentKey = useMemo(() => {
+    return state.files
+      .filter(f => f.type === 'verilog')
+      .map(f => f.content)
+      .join('\0');
+  }, [state.files]);
+
+  useEffect(() => {
+    setNetlist(null);
+  }, [verilogContentKey, state.topModule]);
+
+  const activeFile = state.files.find(f => f.id === state.activeFileId) || null;
+
+  const addConsoleMsg = useCallback((type: ConsoleMessage['type'], message: string, source?: string) => {
+    dispatch({
+      type: 'ADD_CONSOLE_MESSAGE',
+      message: { id: generateMsgId(), type, message, timestamp: Date.now(), source },
+    });
+  }, []);
+
+  // Get constraints source for pin mapping
+  const constraintsSource = useMemo(() => {
+    const xdcFiles = state.files.filter(f => f.type === 'constraints');
+    if (xdcFiles.length === 0) return '';
+    // Merge all XDC sources so custom constraint files are respected even when
+    // multiple .xdc files exist in the project.
+    return xdcFiles.map(f => f.content).join('\n\n');
+  }, [state.files]);
+
+  // Synthesize via Yosys WASM
+  const handleSynthesize = useCallback(async () => {
+    addConsoleMsg('info', 'Starting Yosys synthesis...', 'Synthesis');
+    const verilogFiles = state.files.filter(f => f.type === 'verilog');
+
+    if (verilogFiles.length === 0) {
+      addConsoleMsg('error', 'No design source files found', 'Synthesis');
+      return;
+    }
+
+    // Best-effort module discovery for auto-top fallback only.
+    // Synthesis itself is performed by Yosys and should not be blocked by the
+    // lightweight regex parser limits.
+    const allModules: string[] = [];
+    let parseIssueCount = 0;
+    for (const file of verilogFiles) {
+      const result = parseVerilog(file.content);
+      if (result.errors.length > 0) {
+        parseIssueCount += result.errors.length;
+      } else {
+        for (const mod of result.modules) {
+          allModules.push(mod.name);
+        }
+      }
+    }
+
+    if (parseIssueCount > 0) {
+      addConsoleMsg(
+        'warning',
+        `Pre-parse reported ${parseIssueCount} issue(s); continuing with Yosys synthesis anyway.`,
+        'Synthesis'
+      );
+    }
+
+    // Determine effective top module — auto-detect if current one is missing
+    const uniqueModules = Array.from(new Set(allModules));
+    let topMod = state.topModule || '';
+    if (uniqueModules.length > 0 && (!topMod || !uniqueModules.includes(topMod))) {
+      topMod = detectLikelyTopModule(verilogFiles) || '';
+      dispatch({ type: 'SET_TOP_MODULE', name: topMod });
+      addConsoleMsg('info', `Top module auto-detected: ${topMod}`, 'Synthesis');
+    }
+    if (!topMod) {
+      addConsoleMsg('error', 'No top module selected. Set top module in file explorer and run synthesis again.', 'Synthesis');
+      return;
+    }
+
+    // Collect .v files for Yosys
+    const files: Record<string, string> = {};
+    for (const file of verilogFiles) {
+      files[file.name] = file.content;
+    }
+
+    setIsSynthesizing(true);
+    try {
+      if (!yosysClientRef.current) {
+        yosysClientRef.current = new YosysClient();
+      }
+      addConsoleMsg('info', 'Running Yosys WASM (first run loads ~47MB, may take a moment)...', 'Synthesis');
+
+      const result = await yosysClientRef.current.synthesize(files, topMod);
+
+      // Log Yosys output to console
+      if (result.log) {
+        const lines = result.log.split('\n');
+        for (const line of lines) {
+          if (line.includes('ERROR') || line.includes('error')) {
+            addConsoleMsg('error', line, 'Yosys');
+          } else if (line.includes('Warning') || line.includes('warning')) {
+            addConsoleMsg('warning', line, 'Yosys');
+          }
+        }
+        console.log('[Yosys log]\n' + result.log);
+      }
+
+      setNetlist(result.netlist as YosysNetlist);
+      addConsoleMsg('success', 'Synthesis complete. Gate-level netlist generated.', 'Synthesis');
+      toast.success('Synthesis complete', { description: 'Gate-level netlist generated.' });
+
+      // Check constraints
+      const xdcFile = state.files.find(f => f.type === 'constraints');
+      if (xdcFile) {
+        addConsoleMsg('info', 'Constraints file found: ' + xdcFile.name, 'Synthesis');
+      } else {
+        addConsoleMsg('warning', 'No constraints file (.xdc) found', 'Synthesis');
+      }
+    } catch (err) {
+      addConsoleMsg('error', `Synthesis failed: ${(err as Error).message}`, 'Synthesis');
+      toast.error('Synthesis failed', { description: (err as Error).message });
+      setNetlist(null);
+    } finally {
+      setIsSynthesizing(false);
+    }
+  }, [state.files, state.topModule, addConsoleMsg]);
+
+  // Auto-synthesize when entering board view without a netlist
+  useEffect(() => {
+    if (activeView === 'board' && !netlist && !isSynthesizing && loaded) {
+      handleSynthesize();
+    }
+  }, [activeView]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Run simulation
+  const handleRunSimulation = useCallback(() => {
+    setIsSimulating(true);
+    addConsoleMsg('info', 'Starting behavioral simulation...', 'Simulation');
+
+    const tbFile = state.files.find(f => f.type === 'testbench');
+    if (!tbFile) {
+      addConsoleMsg('error', 'No testbench file found. Create a testbench to run simulation.', 'Simulation');
+      setIsSimulating(false);
+      return;
+    }
+
+    // Find testbench module name
+    const tbParse = parseVerilog(tbFile.content);
+    if (tbParse.modules.length === 0) {
+      addConsoleMsg('error', `No modules found in ${tbFile.name}`, 'Simulation');
+      setIsSimulating(false);
+      return;
+    }
+    const tbModuleName = tbParse.modules[0].name;
+    addConsoleMsg('info', `Testbench: ${tbModuleName}`, 'Simulation');
+
+    // Gather all sources
+    const sources: Record<string, string> = {};
+    for (const file of state.files) {
+      if (file.type === 'verilog' || file.type === 'testbench') {
+        sources[file.name] = file.content;
+      }
+    }
+
+    const verilogFiles = state.files.filter(f => f.type === 'verilog');
+    const topMod = state.topModule || detectLikelyTopModule(verilogFiles) || 'top';
+    if (!state.topModule && topMod) {
+      dispatch({ type: 'SET_TOP_MODULE', name: topMod });
+    }
+    addConsoleMsg('info', `Top module: ${topMod}`, 'Simulation');
+
+    // Use setTimeout to allow UI to update
+    setTimeout(() => {
+      try {
+        const result = simulate(sources, topMod, tbModuleName, 1000);
+
+        if (result.errors.length > 0) {
+          for (const err of result.errors) {
+            addConsoleMsg('error', err, 'Simulation');
+          }
+        }
+
+        for (const log of result.logs) {
+          addConsoleMsg('log', log, 'Simulation');
+        }
+
+        setSimulationResult(result);
+        addConsoleMsg('success',
+          `Simulation complete: ${result.waveform.length} samples, ${result.signals.length} signals, ${result.duration}ns`,
+          'Simulation'
+        );
+        toast.success('Simulation complete', { description: `${result.signals.length} signals, ${result.duration}ns` });
+
+        // Switch to waveform view
+        setBottomTab('waveform');
+
+      } catch (err) {
+        addConsoleMsg('error', `Simulation error: ${(err as Error).message}`, 'Simulation');
+        toast.error('Simulation failed', { description: (err as Error).message });
+      } finally {
+        setIsSimulating(false);
+      }
+    }, 50);
+  }, [state.files, state.topModule, addConsoleMsg]);
+
+  const handleStopSimulation = useCallback(() => {
+    setIsSimulating(false);
+    addConsoleMsg('warning', 'Simulation stopped by user', 'Simulation');
+  }, [addConsoleMsg]);
+
+  // Export project
+  const handleExport = useCallback(() => {
+    const data = JSON.stringify(state, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${state.name.replace(/\s+/g, '_')}.fpgaproj`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addConsoleMsg('info', 'Project exported', 'System');
+  }, [state, addConsoleMsg]);
+
+  // Import project
+  const handleImport = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target?.result as string);
+        dispatch({ type: 'LOAD_PROJECT', state: data });
+        addConsoleMsg('success', `Project loaded: ${data.name}`, 'System');
+      } catch {
+        addConsoleMsg('error', 'Failed to import project file', 'System');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }, [addConsoleMsg]);
+
+  const handleNewProject = useCallback(() => {
+    const defaultState = createDefaultProject();
+    dispatch({ type: 'LOAD_PROJECT', state: defaultState });
+    setSimulationResult(null);
+    addConsoleMsg('info', 'New project created', 'System');
+  }, [addConsoleMsg]);
+
+  const getEditorLanguage = (file: ProjectFile | null) => {
+    if (!file) return 'verilog';
+    if (file.name.endsWith('.xdc')) return 'xdc';
+    return 'verilog';
+  };
+
+  if (!loaded) {
+    return (
+      <div className="h-screen bg-background flex items-center justify-center text-muted-foreground">
+        Loading FPGA Studio...
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".fpgaproj,.json"
+        className="hidden"
+        onChange={handleFileImport}
+      />
+
+      {/* Toolbar */}
+      <Toolbar
+        projectName={state.name}
+        topModule={state.topModule}
+        isSimulating={isSimulating}
+        isSynthesizing={isSynthesizing}
+        activeView={activeView}
+        onRunSimulation={handleRunSimulation}
+        onStopSimulation={handleStopSimulation}
+        onSynthesize={handleSynthesize}
+        onSetView={setActiveView}
+        onExportProject={handleExport}
+        onImportProject={handleImport}
+        onNewProject={handleNewProject}
+      />
+
+      {/* Main content */}
+      <div className="flex-1 overflow-hidden">
+        <ResizablePanelGroup direction="horizontal">
+          {/* Left sidebar - File explorer */}
+          <ResizablePanel defaultSize="20" minSize="12" maxSize="30">
+            <FileExplorer
+              files={state.files}
+              activeFileId={state.activeFileId}
+              topModule={state.topModule}
+              onOpenFile={(id) => dispatch({ type: 'OPEN_FILE', id })}
+              onAddFile={(file) => dispatch({ type: 'ADD_FILE', file })}
+              onDeleteFile={(id) => dispatch({ type: 'DELETE_FILE', id })}
+              onRenameFile={(id, name) => dispatch({ type: 'RENAME_FILE', id, name })}
+              onSetTopModule={(name) => {
+                dispatch({ type: 'SET_TOP_MODULE', name });
+                addConsoleMsg('info', `Top module set to: ${name}`, 'System');
+              }}
+            />
+          </ResizablePanel>
+
+          <ResizableHandle withHandle direction="horizontal" />
+
+          {/* Center - Editor / Board / Waveform */}
+          <ResizablePanel defaultSize="80">
+            <ResizablePanelGroup direction="vertical">
+              {/* Top - Editor or Board view */}
+              <ResizablePanel defaultSize="55" minSize="25">
+                {activeView === 'editor' && (
+                  <div className="h-full flex flex-col">
+                    <EditorTabs
+                      files={state.files}
+                      openFileIds={state.openFileIds}
+                      activeFileId={state.activeFileId}
+                      onSelectFile={(id) => dispatch({ type: 'SET_ACTIVE_FILE', id })}
+                      onCloseFile={(id) => dispatch({ type: 'CLOSE_FILE', id })}
+                    />
+                    <div className="flex-1">
+                      {activeFile ? (
+                        <CodeEditor
+                          key={activeFile.id}
+                          value={activeFile.content}
+                          onChange={(content) =>
+                            dispatch({ type: 'UPDATE_FILE', id: activeFile.id, content })
+                          }
+                          language={getEditorLanguage(activeFile)}
+                        />
+                      ) : (
+                        <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                          <div className="text-center space-y-2">
+                            <p className="text-lg">No file open</p>
+                            <p className="text-xs">Select a file from the explorer or create a new one</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {activeView === 'board' && (
+                  <ScrollArea className="h-full">
+                    <div className="flex items-center justify-center min-h-full p-8">
+                      <Basys3Board
+                        moduleName={state.topModule || 'top'}
+                        netlist={netlist}
+                        constraintsSource={constraintsSource}
+                        isSynthesizing={isSynthesizing}
+                        onSynthesize={handleSynthesize}
+                      />
+                    </div>
+                  </ScrollArea>
+                )}
+
+                {activeView === 'waveform' && (
+                  <WaveformViewer simulation={simulationResult} />
+                )}
+              </ResizablePanel>
+
+              <ResizableHandle withHandle direction="vertical" />
+
+              {/* Bottom panel - Console / Waveform */}
+              <ResizablePanel defaultSize="45" minSize="15" maxSize="70">
+                <Tabs value={bottomTab} onValueChange={(v) => setBottomTab(v as typeof bottomTab)} className="h-full flex flex-col">
+                  <div className="flex items-center justify-between border-b border-border bg-muted/50 px-2 h-8">
+                    <div className="flex items-center gap-2">
+                      <TabsList className="h-8 w-fit rounded-none bg-transparent p-0">
+                        <TabsTrigger value="console" className="text-xs h-6 data-[state=active]:bg-secondary">
+                          Console
+                        </TabsTrigger>
+                        <TabsTrigger value="waveform" className="text-xs h-6 data-[state=active]:bg-secondary">
+                          Waveform
+                          {simulationResult && (
+                            <span className="ml-1 text-[10px] text-green-400">
+                              ({simulationResult.signals.length})
+                            </span>
+                          )}
+                        </TabsTrigger>
+                      </TabsList>
+                      {bottomTab === 'console' && (
+                        <>
+                          {state.consoleMessages.filter(m => m.type === 'error').length > 0 && (
+                            <span className="text-[10px] text-red-600 dark:text-red-400 bg-red-100 dark:bg-red-950 px-1.5 py-0.5 rounded">
+                              {state.consoleMessages.filter(m => m.type === 'error').length} errors
+                            </span>
+                          )}
+                          {state.consoleMessages.filter(m => m.type === 'warning').length > 0 && (
+                            <span className="text-[10px] text-yellow-600 dark:text-yellow-400 bg-yellow-100 dark:bg-yellow-950 px-1.5 py-0.5 rounded">
+                              {state.consoleMessages.filter(m => m.type === 'warning').length} warnings
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </div>
+                    {bottomTab === 'console' && (
+                      <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={() => dispatch({ type: 'CLEAR_CONSOLE' })}>
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    )}
+                  </div>
+                  <TabsContent value="console" className="flex-1 mt-0 overflow-hidden">
+                    <ConsolePanel
+                      messages={state.consoleMessages}
+                    />
+                  </TabsContent>
+                  <TabsContent value="waveform" className="flex-1 mt-0 overflow-hidden">
+                    <WaveformViewer simulation={simulationResult} />
+                  </TabsContent>
+                </Tabs>
+              </ResizablePanel>
+            </ResizablePanelGroup>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+
+      {/* Status bar */}
+      <div className="h-6 border-t border-border bg-muted/80 flex items-center justify-between px-3 text-[10px] text-muted-foreground">
+        <div className="flex items-center gap-3">
+          <span>FPGA Studio v1.0</span>
+          <span>|</span>
+          <span>Target: Basys 3 (XC7A35T-1CPG236C)</span>
+          {state.topModule && (
+            <>
+              <span>|</span>
+              <span>Top: {state.topModule}</span>
+            </>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          {activeFile && (
+            <>
+              <span>{activeFile.name}</span>
+              <span>|</span>
+              <span>{activeFile.content.split('\n').length} lines</span>
+            </>
+          )}
+          {isSynthesizing && (
+            <span className="text-yellow-400 animate-pulse">Synthesizing...</span>
+          )}
+          {isSimulating && (
+            <span className="text-yellow-400 animate-pulse">Simulating...</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
