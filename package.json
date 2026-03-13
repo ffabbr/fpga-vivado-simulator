@@ -14,6 +14,7 @@
     "@yowasp/yosys": "^0.64.89-dev.1114",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
     "lucide-react": "^0.577.0",
     "monaco-editor": "^0.55.1",
     "next": "16.1.6",

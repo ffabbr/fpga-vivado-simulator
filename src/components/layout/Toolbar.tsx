@@ -29,12 +29,13 @@ interface ToolbarProps {
   onImportProject: () => void;
   onNewProject: () => void;
   onNewFile: () => void;
+  onOpenCommandMenu: () => void;
 }
 
 export default function Toolbar({
   projectName, isSimulating, isSynthesizing, activeView,
   onRunSimulation, onStopSimulation, onSynthesize,
-  onSetView, onExportProject, onImportProject, onNewProject, onNewFile,
+  onSetView, onExportProject, onImportProject, onNewProject, onNewFile, onOpenCommandMenu,
 }: ToolbarProps) {
   const runEditorCommand = (commandId: string) => {
     const editor = window.__fpgaActiveEditor;
@@ -197,6 +198,9 @@ export default function Toolbar({
                 <LayoutGrid className="h-4 w-4 mr-2" /> Open Board View
               </MenubarItem>
             </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger className="text-xs h-7 px-2" onClick={onOpenCommandMenu}>Search</MenubarTrigger>
           </MenubarMenu>
         </Menubar>
 

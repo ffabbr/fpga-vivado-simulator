@@ -12,6 +12,7 @@ import { parseVerilog } from '@/lib/verilog-parser';
 import { YosysClient } from '@/lib/yosys-client';
 import type { YosysNetlist } from '@/lib/gate-sim';
 import Toolbar from '@/components/layout/Toolbar';
+import CommandMenu from '@/components/layout/CommandMenu';
 import EditorTabs from '@/components/layout/EditorTabs';
 import FileExplorer from '@/components/project/FileExplorer';
 import ConsolePanel from '@/components/console/ConsolePanel';
@@ -68,6 +69,7 @@ export default function Home() {
   const [netlist, setNetlist] = useState<YosysNetlist | null>(null);
   const [bottomTab, setBottomTab] = useState<'console' | 'waveform'>('console');
   const [newFileDialogOpen, setNewFileDialogOpen] = useState(false);
+  const [commandMenuOpen, setCommandMenuOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const yosysClientRef = useRef<YosysClient | null>(null);
@@ -403,6 +405,29 @@ export default function Home() {
         onChange={handleFileImport}
       />
 
+      {/* Command Menu (Cmd+K) */}
+      <CommandMenu
+        open={commandMenuOpen}
+        onOpenChange={setCommandMenuOpen}
+        files={state.files}
+        activeView={activeView}
+        isSimulating={isSimulating}
+        isSynthesizing={isSynthesizing}
+        onOpenFile={(id) => {
+          dispatch({ type: 'OPEN_FILE', id });
+          if (activeView === 'board') setActiveView('editor');
+        }}
+        onSetView={setActiveView}
+        onSynthesize={handleSynthesize}
+        onRunSimulation={handleRunSimulation}
+        onStopSimulation={handleStopSimulation}
+        onNewFile={() => setNewFileDialogOpen(true)}
+        onNewProject={handleNewProject}
+        onExportProject={handleExport}
+        onImportProject={handleImport}
+        onClearConsole={() => dispatch({ type: 'CLEAR_CONSOLE' })}
+      />
+
       {/* Toolbar */}
       <Toolbar
         projectName={state.name}
@@ -417,6 +442,7 @@ export default function Home() {
         onImportProject={handleImport}
         onNewProject={handleNewProject}
         onNewFile={() => setNewFileDialogOpen(true)}
+        onOpenCommandMenu={() => setCommandMenuOpen(true)}
       />
 
       {/* Main content */}
