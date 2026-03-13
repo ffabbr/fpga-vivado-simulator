@@ -67,6 +67,7 @@ export default function Home() {
   const [simulationResult, setSimulationResult] = useState<SimulationResult | null>(null);
   const [netlist, setNetlist] = useState<YosysNetlist | null>(null);
   const [bottomTab, setBottomTab] = useState<'console' | 'waveform'>('console');
+  const [newFileDialogOpen, setNewFileDialogOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const yosysClientRef = useRef<YosysClient | null>(null);
@@ -234,6 +235,13 @@ export default function Home() {
     const tbFile = state.files.find(f => f.type === 'testbench');
     if (!tbFile) {
       addConsoleMsg('error', 'No testbench file found. Create a testbench to run simulation.', 'Simulation');
+      toast.info('No simulation module detected', {
+        description: 'Open FPGA Board view to inspect the synthesized design instead.',
+        action: {
+          label: 'Open Board View',
+          onClick: () => setActiveView('board'),
+        },
+      });
       setIsSimulating(false);
       return;
     }
@@ -242,6 +250,13 @@ export default function Home() {
     const tbParse = parseVerilog(tbFile.content);
     if (tbParse.modules.length === 0) {
       addConsoleMsg('error', `No modules found in ${tbFile.name}`, 'Simulation');
+      toast.info('No simulation module detected', {
+        description: 'Open FPGA Board view to inspect the synthesized design instead.',
+        action: {
+          label: 'Open Board View',
+          onClick: () => setActiveView('board'),
+        },
+      });
       setIsSimulating(false);
       return;
     }
@@ -352,14 +367,34 @@ export default function Home() {
 
   if (!loaded) {
     return (
-      <div className="h-screen bg-background flex items-center justify-center text-muted-foreground">
-        Loading FPGA Studio...
-      </div>
+      <>
+        <div className="md:hidden fixed inset-0 z-50 bg-background flex items-center justify-center p-6 text-center">
+          <div className="max-w-sm space-y-3">
+            <p className="text-lg font-semibold text-foreground">Mobile Not Supported Yet</p>
+            <p className="text-sm text-muted-foreground">
+              FPGA Studio currently supports desktop widths only. Please open this app on a larger screen.
+            </p>
+          </div>
+        </div>
+        <div className="hidden md:flex h-screen bg-background items-center justify-center text-muted-foreground">
+          Loading FPGA Studio...
+        </div>
+      </>
     );
   }
 
   return (
-    <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden">
+    <>
+      <div className="md:hidden fixed inset-0 z-50 bg-background flex items-center justify-center p-6 text-center">
+        <div className="max-w-sm space-y-3">
+          <p className="text-lg font-semibold text-foreground">Mobile Not Supported Yet</p>
+          <p className="text-sm text-muted-foreground">
+            FPGA Studio currently supports desktop widths only. Please open this app on a larger screen.
+          </p>
+        </div>
+      </div>
+
+      <div className="hidden md:flex h-screen flex-col bg-background text-foreground overflow-hidden">
       <input
         ref={fileInputRef}
         type="file"
@@ -371,7 +406,6 @@ export default function Home() {
       {/* Toolbar */}
       <Toolbar
         projectName={state.name}
-        topModule={state.topModule}
         isSimulating={isSimulating}
         isSynthesizing={isSynthesizing}
         activeView={activeView}
@@ -382,6 +416,7 @@ export default function Home() {
         onExportProject={handleExport}
         onImportProject={handleImport}
         onNewProject={handleNewProject}
+        onNewFile={() => setNewFileDialogOpen(true)}
       />
 
       {/* Main content */}
@@ -393,7 +428,16 @@ export default function Home() {
               files={state.files}
               activeFileId={state.activeFileId}
               topModule={state.topModule}
-              onOpenFile={(id) => dispatch({ type: 'OPEN_FILE', id })}
+              isSynthesizing={isSynthesizing}
+              isSimulating={isSimulating}
+              createDialogOpen={newFileDialogOpen}
+              onCreateDialogOpenChange={setNewFileDialogOpen}
+              onOpenFile={(id) => {
+                dispatch({ type: 'OPEN_FILE', id });
+                if (activeView === 'board') {
+                  setActiveView('editor');
+                }
+              }}
               onAddFile={(file) => dispatch({ type: 'ADD_FILE', file })}
               onDeleteFile={(id) => dispatch({ type: 'DELETE_FILE', id })}
               onRenameFile={(id, name) => dispatch({ type: 'RENAME_FILE', id, name })}
@@ -410,7 +454,7 @@ export default function Home() {
           <ResizablePanel defaultSize="80">
             <ResizablePanelGroup direction="vertical">
               {/* Top - Editor or Board view */}
-              <ResizablePanel defaultSize="55" minSize="25">
+              <ResizablePanel defaultSize="75" minSize="25">
                 {activeView === 'editor' && (
                   <div className="h-full flex flex-col">
                     <EditorTabs
@@ -464,7 +508,7 @@ export default function Home() {
               <ResizableHandle withHandle direction="vertical" />
 
               {/* Bottom panel - Console / Waveform */}
-              <ResizablePanel defaultSize="45" minSize="15" maxSize="70">
+              <ResizablePanel defaultSize="25" minSize="15" maxSize="70">
                 <Tabs value={bottomTab} onValueChange={(v) => setBottomTab(v as typeof bottomTab)} className="h-full flex flex-col">
                   <div className="flex items-center justify-between border-b border-border bg-muted/50 px-2 h-8">
                     <div className="flex items-center gap-2">
@@ -546,6 +590,7 @@ export default function Home() {
           )}
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

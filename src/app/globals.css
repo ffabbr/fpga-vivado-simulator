@@ -137,3 +137,19 @@
     @apply font-sans;
   }
 }
+
+@layer components {
+  .toaster [data-sonner-toast] {
+    background: var(--background) !important;
+    color: var(--foreground) !important;
+    border-color: var(--border) !important;
+  }
+
+  .toaster [data-sonner-toast] [data-title] {
+    color: var(--foreground) !important;
+  }
+
+  .toaster [data-sonner-toast] [data-description] {
+    color: var(--muted-foreground) !important;
+  }
+}

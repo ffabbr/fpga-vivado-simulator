@@ -5,6 +5,12 @@ import Editor, { OnMount } from '@monaco-editor/react';
 import { verilogLanguageConfig, verilogTokensProvider, verilogDarkTheme, verilogLightTheme } from '@/lib/verilog-language';
 import type * as Monaco from 'monaco-editor';
 
+declare global {
+  interface Window {
+    __fpgaActiveEditor?: Monaco.editor.IStandaloneCodeEditor;
+  }
+}
+
 interface CodeEditorProps {
   value: string;
   onChange: (value: string) => void;
@@ -34,6 +40,17 @@ export default function CodeEditor({ value, onChange, language, readOnly = false
   const handleEditorMount: OnMount = useCallback((editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
+    window.__fpgaActiveEditor = editor;
+
+    editor.onDidFocusEditorText(() => {
+      window.__fpgaActiveEditor = editor;
+    });
+
+    editor.onDidDispose(() => {
+      if (window.__fpgaActiveEditor === editor) {
+        delete window.__fpgaActiveEditor;
+      }
+    });
 
     // Register Verilog language
     if (!monaco.languages.getLanguages().some((l: { id: string }) => l.id === 'verilog')) {

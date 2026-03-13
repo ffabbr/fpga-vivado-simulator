@@ -3,8 +3,9 @@
 import { useState, useCallback } from 'react';
 import {
   FileText, FilePlus2, Trash2, Pencil, Copy,
-  FileCode2, TestTube2, Settings2, MoreHorizontal, Cpu,
+  FileCode2, TestTube2, Settings2, Cpu, ChevronDown, MoreHorizontal,
 } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -12,14 +13,17 @@ import {
   ContextMenuSeparator, ContextMenuTrigger,
 } from '@/components/ui/context-menu';
 import {
-  DropdownMenu, DropdownMenuContent, DropdownMenuItem,
-  DropdownMenuSeparator, DropdownMenuTrigger,
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel,
   AlertDialogContent, AlertDialogDescription, AlertDialogFooter,
   AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter,
+  DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
 import { ProjectFile, createFile } from '@/lib/store';
 
@@ -27,6 +31,10 @@ interface FileExplorerProps {
   files: ProjectFile[];
   activeFileId: string | null;
   topModule: string | null;
+  isSynthesizing?: boolean;
+  isSimulating?: boolean;
+  createDialogOpen?: boolean;
+  onCreateDialogOpenChange?: (open: boolean) => void;
   onOpenFile: (id: string) => void;
   onAddFile: (file: ProjectFile) => void;
   onDeleteFile: (id: string) => void;
@@ -42,45 +50,70 @@ const FILE_ICONS: Record<string, React.ReactNode> = {
   other: <FileText className="h-4 w-4 text-muted-foreground" />,
 };
 
-function detectFileType(name: string): ProjectFile['type'] {
-  if (name.endsWith('.xdc')) return 'constraints';
-  if (name.match(/_tb\.v$|_tb\.sv$|_test\.v$/)) return 'testbench';
-  if (name.endsWith('.v') || name.endsWith('.sv') || name.endsWith('.vh')) return 'verilog';
-  if (name.endsWith('.mem') || name.endsWith('.hex')) return 'memory';
-  return 'other';
-}
-
 export default function FileExplorer({
-  files, activeFileId, topModule, onOpenFile, onAddFile, onDeleteFile, onRenameFile, onSetTopModule,
+  files, activeFileId, topModule, isSynthesizing, isSimulating, createDialogOpen, onCreateDialogOpenChange, onOpenFile, onAddFile, onDeleteFile, onRenameFile, onSetTopModule,
 }: FileExplorerProps) {
-  const [isCreating, setIsCreating] = useState(false);
+  const [internalDialogOpen, setInternalDialogOpen] = useState(false);
+  const isCreateDialogOpen = createDialogOpen ?? internalDialogOpen;
+  const setIsCreateDialogOpen = onCreateDialogOpenChange ?? setInternalDialogOpen;
   const [newFileName, setNewFileName] = useState('');
+  const [newFileType, setNewFileType] = useState<ProjectFile['type']>('verilog');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<ProjectFile | null>(null);
 
+  const initCreateDefaults = useCallback(() => {
+    setNewFileType('verilog');
+    setNewFileName('new_module.v');
+  }, []);
+
+  const openCreateDialog = useCallback(() => {
+    initCreateDefaults();
+    setIsCreateDialogOpen(true);
+  }, [initCreateDefaults]);
+
+  const fileTypeLabel = useCallback((type: ProjectFile['type']) => {
+    switch (type) {
+      case 'verilog': return 'Design Source (Verilog)';
+      case 'testbench': return 'Testbench';
+      case 'constraints': return 'Constraints (.xdc)';
+      default: return 'Other';
+    }
+  }, []);
+
+  const onCreateTypeChange = useCallback((type: ProjectFile['type']) => {
+    setNewFileType(type);
+  }, []);
+
   const handleCreate = useCallback(() => {
     if (!newFileName.trim()) {
-      setIsCreating(false);
       return;
     }
-    const type = detectFileType(newFileName);
+
+    let finalName = newFileName.trim();
+    if (!finalName.includes('.')) {
+      if (newFileType === 'verilog') finalName += '.v';
+      else if (newFileType === 'testbench') finalName += '_tb.v';
+      else if (newFileType === 'constraints') finalName += '.xdc';
+    }
+
+    const type = newFileType;
     let template = '';
     if (type === 'verilog') {
-      const modName = newFileName.replace(/\.(v|sv|vh)$/, '');
+      const modName = finalName.replace(/\.(v|sv|vh)$/, '');
       template = `module ${modName}(\n    \n);\n\n    \n\nendmodule\n`;
     } else if (type === 'testbench') {
-      const modName = newFileName.replace(/\.(v|sv)$/, '');
+      const modName = finalName.replace(/\.(v|sv)$/, '');
       template = `\`timescale 1ns / 1ps\n\nmodule ${modName};\n\n    initial begin\n        \n        $finish;\n    end\n\nendmodule\n`;
     } else if (type === 'constraints') {
       template = `## Constraints file\n## Target: Basys 3 (xc7a35tcpg236-1)\n\n`;
     }
 
-    const file = createFile(newFileName, template, type);
+    const file = createFile(finalName, template, type);
     onAddFile(file);
     setNewFileName('');
-    setIsCreating(false);
-  }, [newFileName, onAddFile]);
+    setIsCreateDialogOpen(false);
+  }, [newFileName, newFileType, onAddFile]);
 
   const handleRename = useCallback((id: string) => {
     if (!renameValue.trim()) {
@@ -110,52 +143,12 @@ export default function FileExplorer({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Sources</span>
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            render={
-              <Button variant="ghost" size="sm" className="h-6 w-6 p-0">
-                <FilePlus2 className="h-3.5 w-3.5" />
-              </Button>
-            }
-          />
-          <DropdownMenuContent align="end" className="min-w-48">
-            <DropdownMenuItem onClick={() => { setNewFileName('new_module.v'); setIsCreating(true); }}>
-              <FileCode2 className="h-4 w-4 mr-2 text-blue-500" /> Design Source (.v)
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => { setNewFileName('new_tb.v'); setIsCreating(true); }}>
-              <TestTube2 className="h-4 w-4 mr-2 text-green-500" /> Testbench (.v)
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => { setNewFileName('constraints.xdc'); setIsCreating(true); }}>
-              <Settings2 className="h-4 w-4 mr-2 text-yellow-500" /> Constraints (.xdc)
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => { setNewFileName(''); setIsCreating(true); }}>
-              <FileText className="h-4 w-4 mr-2" /> Other File
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+      {/* Add file button */}
+      <div className="px-4 py-3">
+        <Button variant="outline" size="sm" className="w-full h-7 text-xs" onClick={openCreateDialog}>
+          <FilePlus2 className="h-3.5 w-3.5" /> New File
+        </Button>
       </div>
-
-      {/* New file input */}
-      {isCreating && (
-        <div className="px-3 py-2 border-b border-border">
-          <Input
-            value={newFileName}
-            onChange={e => setNewFileName(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') handleCreate();
-              if (e.key === 'Escape') setIsCreating(false);
-            }}
-            onBlur={handleCreate}
-            placeholder="filename.v"
-            className="h-7 text-xs"
-            autoFocus
-          />
-        </div>
-      )}
 
       {/* File tree */}
       <div className="flex-1 overflow-y-auto py-1">
@@ -168,49 +161,96 @@ export default function FileExplorer({
             other: 'Other',
           };
           return (
-            <div key={group} className="mb-1">
-              <div className="px-3 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
+            <div key={group} className="mb-3">
+              <div className="px-4 py-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
                 {groupLabels[group]}
               </div>
-              <div className="px-2 space-y-0.5">
+              <div className="px-3 space-y-0.5">
                 {groupFiles.map(file => (
                   <ContextMenu key={file.id}>
                     <ContextMenuTrigger>
-                      <button
-                        className={`w-full flex items-center gap-2 px-2 py-1.5 text-left text-sm rounded-md border transition-colors ${
-                          activeFileId === file.id
-                            ? 'bg-accent text-accent-foreground border-border'
-                            : 'text-muted-foreground border-transparent hover:text-foreground hover:bg-accent/50'
-                        }`}
-                        onClick={() => onOpenFile(file.id)}
-                        onDoubleClick={() => {
-                          setRenamingId(file.id);
-                          setRenameValue(file.name);
-                        }}
-                      >
-                        {FILE_ICONS[file.type]}
-                        {renamingId === file.id ? (
-                          <Input
-                            value={renameValue}
-                            onChange={e => setRenameValue(e.target.value)}
-                            onKeyDown={e => {
-                              if (e.key === 'Enter') handleRename(file.id);
-                              if (e.key === 'Escape') setRenamingId(null);
-                            }}
-                            onBlur={() => handleRename(file.id)}
-                            className="h-5 text-xs py-0 px-1"
-                            autoFocus
-                            onClick={e => e.stopPropagation()}
+                      <div className="group/file relative">
+                        <button
+                          className={`w-full flex items-center gap-2 px-2 py-1.5 pr-8 text-left text-sm rounded-md border transition-colors ${
+                            activeFileId === file.id
+                              ? 'bg-accent text-accent-foreground border-border'
+                              : 'text-muted-foreground border-transparent hover:text-foreground hover:bg-accent/50'
+                          }`}
+                          onClick={() => onOpenFile(file.id)}
+                          onDoubleClick={() => {
+                            setRenamingId(file.id);
+                            setRenameValue(file.name);
+                          }}
+                        >
+                          {FILE_ICONS[file.type]}
+                          {renamingId === file.id ? (
+                            <Input
+                              value={renameValue}
+                              onChange={e => setRenameValue(e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') handleRename(file.id);
+                                if (e.key === 'Escape') setRenamingId(null);
+                              }}
+                              onBlur={() => handleRename(file.id)}
+                              className="h-5 text-xs py-0 px-1"
+                              autoFocus
+                              onClick={e => e.stopPropagation()}
+                            />
+                          ) : (
+                            <span className="truncate text-xs">{file.name}</span>
+                          )}
+                          {topModule && file.type === 'verilog' && file.content.includes(`module ${topModule}`) && (
+                            <Badge variant="outline" className="h-4 text-[9px] px-1 border-blue-500/50 text-blue-500">
+                              TOP
+                            </Badge>
+                          )}
+                        </button>
+
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="absolute right-1 top-1/2 -translate-y-1/2 h-6 w-6 p-0 opacity-0 group-hover/file:opacity-100 data-[state=open]:opacity-100"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <MoreHorizontal className="h-3.5 w-3.5" />
+                                <span className="sr-only">Open file actions</span>
+                              </Button>
+                            }
                           />
-                        ) : (
-                          <span className="truncate flex-1 text-xs">{file.name}</span>
-                        )}
-                        {topModule && file.type === 'verilog' && file.content.includes(`module ${topModule}`) && (
-                          <Badge variant="outline" className="h-4 text-[9px] px-1 border-blue-500/50 text-blue-500">
-                            TOP
-                          </Badge>
-                        )}
-                      </button>
+                          <DropdownMenuContent align="end" className="min-w-48">
+                            <DropdownMenuItem onClick={() => onOpenFile(file.id)}>
+                              Open
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => {
+                              setRenamingId(file.id);
+                              setRenameValue(file.name);
+                            }}>
+                              <Pencil className="h-3.5 w-3.5 mr-2" /> Rename
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => handleDuplicate(file)}>
+                              <Copy className="h-3.5 w-3.5 mr-2" /> Duplicate
+                            </DropdownMenuItem>
+                            {file.type === 'verilog' && (
+                              <DropdownMenuItem onClick={() => {
+                                const match = file.content.match(/module\s+(\w+)/);
+                                if (match) onSetTopModule(match[1]);
+                              }}>
+                                <Cpu className="h-3.5 w-3.5 mr-2" /> Set as Top Module
+                              </DropdownMenuItem>
+                            )}
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-destructive"
+                              onClick={() => setDeleteTarget(file)}
+                            >
+                              <Trash2 className="h-3.5 w-3.5 mr-2" /> Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
                       <ContextMenuItem onClick={() => onOpenFile(file.id)}>
@@ -250,8 +290,18 @@ export default function FileExplorer({
       </div>
 
       {/* Bottom info */}
-      <div className="px-3 py-2 border-t border-border text-[10px] text-muted-foreground">
-        {files.length} source{files.length !== 1 ? 's' : ''} · Basys 3
+      <div className="px-4 py-3 border-t border-border text-[10px] text-muted-foreground flex items-center justify-between">
+        <span>{files.length} source{files.length !== 1 ? 's' : ''} · Basys 3</span>
+        {(isSynthesizing || isSimulating) ? (
+          <Badge variant="secondary" className="h-5 text-[10px]">
+            {isSynthesizing ? 'Synthesizing' : 'Simulating'}
+            <Spinner data-icon="inline-end" className="h-3 w-3" />
+          </Badge>
+        ) : topModule ? (
+          <Badge variant="outline" className="h-5 text-[10px] border-blue-500/30 text-blue-500">
+            <Cpu className="h-3 w-3 mr-1" /> {topModule}
+          </Badge>
+        ) : null}
       </div>
 
       {/* Delete confirmation dialog */}
@@ -279,6 +329,64 @@ export default function FileExplorer({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Create file dialog */}
+      <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Create New File</DialogTitle>
+            <DialogDescription>Enter a filename and choose the file type.</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Filename</label>
+              <Input
+                value={newFileName}
+                onChange={e => setNewFileName(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') handleCreate();
+                }}
+                placeholder="new_module.v"
+                autoFocus
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">File Type</label>
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button variant="outline" className="w-full justify-between">
+                      {fileTypeLabel(newFileType)}
+                      <ChevronDown className="h-4 w-4 opacity-70" />
+                    </Button>
+                  }
+                />
+                <DropdownMenuContent align="start" className="w-(--anchor-width)">
+                  <DropdownMenuItem onClick={() => onCreateTypeChange('verilog')}>
+                    <FileCode2 className="h-4 w-4 mr-2 text-blue-500" /> Design Source (Verilog)
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onCreateTypeChange('testbench')}>
+                    <TestTube2 className="h-4 w-4 mr-2 text-green-500" /> Testbench
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onCreateTypeChange('constraints')}>
+                    <Settings2 className="h-4 w-4 mr-2 text-yellow-500" /> Constraints (.xdc)
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onCreateTypeChange('other')}>
+                    <FileText className="h-4 w-4 mr-2 text-muted-foreground" /> Other
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setIsCreateDialogOpen(false)}>Cancel</Button>
+            <Button onClick={handleCreate}>Create File</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
