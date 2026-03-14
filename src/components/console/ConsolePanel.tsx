@@ -10,7 +10,7 @@ interface ConsolePanelProps {
 }
 
 const ICONS: Record<string, React.ReactNode> = {
-  info: <Info className="h-3.5 w-3.5 text-blue-500 shrink-0" />,
+  info: <Info className="h-3.5 w-3.5 text-muted-foreground shrink-0" />,
   warning: <AlertTriangle className="h-3.5 w-3.5 text-yellow-500 shrink-0" />,
   error: <AlertCircle className="h-3.5 w-3.5 text-red-500 shrink-0" />,
   success: <CheckCircle2 className="h-3.5 w-3.5 text-green-500 shrink-0" />,
@@ -18,7 +18,7 @@ const ICONS: Record<string, React.ReactNode> = {
 };
 
 const COLORS: Record<string, string> = {
-  info: 'text-blue-600 dark:text-blue-300',
+  info: 'text-muted-foreground',
   warning: 'text-yellow-600 dark:text-yellow-300',
   error: 'text-red-600 dark:text-red-300',
   success: 'text-green-600 dark:text-green-300',
@@ -39,7 +39,7 @@ export default function ConsolePanel({ messages }: ConsolePanelProps) {
         <div className="p-2 font-mono text-xs space-y-0.5">
           {messages.length === 0 && (
             <div className="text-muted-foreground italic py-4 text-center">
-              Console output will appear here...
+              Waiting for Console output.
             </div>
           )}
           {messages.map(msg => (

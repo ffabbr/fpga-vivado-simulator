@@ -43,6 +43,8 @@ export class GateLevelSimulator {
   private dffState: Map<string, number> = new Map(); // cell name → stored Q bit
   private portBits: { inputs: Record<string, (number | string)[]>; outputs: Record<string, (number | string)[]> } = { inputs: {}, outputs: {} };
   private prevClk = 0;
+  private hasPosEdgeDFF = false;
+  private hasNegEdgeDFF = false;
 
   constructor(netlist: YosysNetlist, topModule: string) {
     const availableModules = Object.keys(netlist.modules || {});
@@ -136,10 +138,15 @@ export class GateLevelSimulator {
       }
     }
 
-    // Initialize DFF states to 0
+    // Initialize DFF states to 0 and detect which clock edges matter
     for (const { name, cell } of this.sortedCells) {
       if (this.isDFF(cell.type)) {
         this.dffState.set(name, 0);
+        if (cell.type === '$_DFF_N_') {
+          this.hasNegEdgeDFF = true;
+        } else {
+          this.hasPosEdgeDFF = true;
+        }
       }
     }
   }
@@ -165,9 +172,66 @@ export class GateLevelSimulator {
     const negEdge = clkVal === 0 && this.prevClk === 1;
     this.prevClk = clkVal;
 
-    // Walk cells in topo order
-    for (const { name, cell } of this.sortedCells) {
-      this.evaluateCell(name, cell, posEdge, negEdge);
+    // Only use expensive two-phase DFF evaluation when DFFs will actually
+    // capture on this edge. Skip if no DFFs care about the current edge type.
+    const relevantEdge =
+      (posEdge && this.hasPosEdgeDFF) || (negEdge && this.hasNegEdgeDFF);
+
+    if (relevantEdge) {
+      // Phase 1: Output current Q values and sample D inputs
+      const dffCaptures = new Map<string, number>();
+      for (const { name, cell } of this.sortedCells) {
+        if (this.isDFF(cell.type)) {
+          // First, output the OLD Q so downstream combinational logic sees previous state
+          this.setNet(cell.connections['Q'][0], this.dffState.get(name) ?? 0);
+        }
+      }
+      // Evaluate combinational cells to propagate current state to DFF D inputs
+      for (const { name, cell } of this.sortedCells) {
+        if (!this.isDFF(cell.type)) {
+          this.evaluateCell(name, cell, false, false);
+        }
+      }
+      // Now sample all D inputs simultaneously
+      for (const { name, cell } of this.sortedCells) {
+        if (this.isDFF(cell.type)) {
+          const shouldCapture =
+            (cell.type === '$_DFF_P_' && posEdge) ||
+            (cell.type === '$_DFF_N_' && negEdge) ||
+            (cell.type === '$_DFFE_PP_' && posEdge && this.getNet(cell.connections['E'][0]) === 1) ||
+            (cell.type === '$_SDFF_PP0_' && posEdge);
+          if (shouldCapture) {
+            if (cell.type === '$_SDFF_PP0_' && this.getNet(cell.connections['R'][0]) === 1) {
+              dffCaptures.set(name, 0);
+            } else {
+              dffCaptures.set(name, this.getNet(cell.connections['D'][0]));
+            }
+          }
+        }
+      }
+      // Phase 2: Apply all captured values and re-evaluate combinational logic
+      for (const [name, val] of dffCaptures) {
+        this.dffState.set(name, val);
+      }
+      for (const { name, cell } of this.sortedCells) {
+        if (this.isDFF(cell.type)) {
+          this.setNet(cell.connections['Q'][0], this.dffState.get(name) ?? 0);
+        }
+      }
+      for (const { name, cell } of this.sortedCells) {
+        if (!this.isDFF(cell.type)) {
+          this.evaluateCell(name, cell, false, false);
+        }
+      }
+    } else {
+      // No clock edge: just evaluate combinational logic with current DFF outputs
+      for (const { name, cell } of this.sortedCells) {
+        if (this.isDFF(cell.type)) {
+          this.setNet(cell.connections['Q'][0], this.dffState.get(name) ?? 0);
+        } else {
+          this.evaluateCell(name, cell, false, false);
+        }
+      }
     }
 
     // Pack multi-bit outputs

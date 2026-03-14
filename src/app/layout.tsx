@@ -10,8 +10,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "FPGA Studio - Vivado-like FPGA Simulator",
+  title: "FPGA Studio",
   description: "Web-based FPGA development environment with Verilog editor, simulator, and Basys 3 board emulation",
+  robots: "noindex",
 };
 
 export default function RootLayout({

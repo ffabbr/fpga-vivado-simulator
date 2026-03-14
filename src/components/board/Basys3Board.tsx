@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { GateLevelSimulator, type YosysNetlist } from '@/lib/gate-sim';
 import {
   buildBoardMapping,
@@ -54,6 +54,7 @@ function SegmentPaths({ color, segments, glow }: { color: string; segments: numb
 }
 
 export default function Basys3Board({ moduleName, netlist, constraintsSource, isSynthesizing, onSynthesize }: Basys3BoardProps) {
+  const [powerOn, setPowerOn] = useState(true);
   const [switches, setSwitches] = useState<boolean[]>(new Array(16).fill(false));
   const [buttons, setButtons] = useState({ btnC: false, btnU: false, btnD: false, btnL: false, btnR: false });
 
@@ -98,7 +99,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
     }
   }, [netlist, moduleName]);
 
-  // Build board-level inputs
+  // Build board-level inputs (without clk — clk is driven by the simulation loop)
   const boardInputs = useMemo(() => {
     let swVal = 0;
     for (let i = 0; i < 16; i++) {
@@ -106,7 +107,6 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
     }
     return {
       sw: swVal,
-      clk: 0,
       btnC: buttons.btnC ? 1 : 0,
       btnU: buttons.btnU ? 1 : 0,
       btnD: buttons.btnD ? 1 : 0,
@@ -115,50 +115,188 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
     };
   }, [switches, buttons]);
 
-  // Evaluate design via gate-level simulator only
-  const outputs = useMemo(() => {
-    const defaults = { led: 0, seg: 0x7F, dp: 1, an: 0xF };
-    if (!gateSim) return defaults;
+  // Per-digit segment state for time-multiplexed 7-seg display
+  const [digitSegments, setDigitSegments] = useState<number[]>([0x7F, 0x7F, 0x7F, 0x7F]);
+  const [digitDp, setDigitDp] = useState<number[]>([1, 1, 1, 1]);
+  const [outputs, setOutputs] = useState({ led: 0, seg: 0x7F, dp: 1, an: 0xF });
+
+  // Check if the design uses a clock input (check board signal, not user port name)
+  const hasClock = useMemo(() => {
+    if (!gateSim) return false;
+    if (portMapping) return portMapping.some(m => m.boardSignal === 'clk');
+    return true; // assume clock if no mapping
+  }, [gateSim, portMapping]);
+
+  // Combinational (non-clocked) evaluation — re-runs on input changes
+  useEffect(() => {
+    if (!gateSim || hasClock) return;
     try {
       const simInputs = portMapping
-        ? boardInputsToUserPorts(boardInputs, portMapping)
-        : boardInputs;
-
+        ? boardInputsToUserPorts({ ...boardInputs, clk: 0 }, portMapping)
+        : { ...boardInputs, clk: 0 };
       const rawResult = gateSim.evaluate(simInputs);
-
+      let seg: number, dp: number, an: number, led: number;
       if (portMapping) {
         const boardOut = userOutputsToBoardOutputs(rawResult, portMapping);
-        return {
-          led: boardOut.led ?? 0,
-          seg: boardOut.seg ?? 0x7F,
-          dp: boardOut.dp ?? 1,
-          an: boardOut.an ?? 0xF,
-        };
+        led = boardOut.led ?? 0;
+        seg = boardOut.seg ?? 0x7F;
+        dp = boardOut.dp ?? 1;
+        an = boardOut.an ?? 0xF;
+      } else {
+        led = rawResult.led ?? 0;
+        seg = rawResult.seg ?? 0x7F;
+        dp = rawResult.dp ?? 1;
+        an = rawResult.an ?? 0xF;
       }
-
-      return {
-        led: rawResult.led ?? 0,
-        seg: rawResult.seg ?? 0x7F,
-        dp: rawResult.dp ?? 1,
-        an: rawResult.an ?? 0xF,
-      };
+      setOutputs({ led, seg, dp, an });
+      // For combinational designs, set per-digit state directly from an/seg
+      const newDigitSeg = [0x7F, 0x7F, 0x7F, 0x7F];
+      const newDigitDp = [1, 1, 1, 1];
+      for (let d = 0; d < 4; d++) {
+        if (!((an >> d) & 1)) {
+          newDigitSeg[d] = seg;
+          newDigitDp[d] = dp;
+        }
+      }
+      setDigitSegments(newDigitSeg);
+      setDigitDp(newDigitDp);
     } catch (e) {
       console.warn('Board simulation error:', e);
-      return defaults;
     }
-  }, [gateSim, boardInputs, portMapping]);
+  }, [gateSim, hasClock, boardInputs, portMapping]);
 
-  const debugRawOutputs = useMemo(() => {
-    if (!gateSim) return null;
-    try {
-      const simInputs = portMapping
-        ? boardInputsToUserPorts(boardInputs, portMapping)
-        : boardInputs;
-      return gateSim.evaluate(simInputs);
-    } catch {
-      return null;
+  // Clock simulation loop — drives DFFs in the gate-level simulator
+  const clkRef = useRef(0);
+  const boardInputsRef = useRef(boardInputs);
+  boardInputsRef.current = boardInputs;
+  const portMappingRef = useRef(portMapping);
+  portMappingRef.current = portMapping;
+
+  useEffect(() => {
+    if (!gateSim || !hasClock) {
+      if (!gateSim) {
+        setOutputs({ led: 0, seg: 0x7F, dp: 1, an: 0xF });
+        setDigitSegments([0x7F, 0x7F, 0x7F, 0x7F]);
+        setDigitDp([1, 1, 1, 1]);
+      }
+      return;
     }
-  }, [gateSim, boardInputs, portMapping]);
+
+    // Sequential design — run a clock simulation
+    // We run many clock cycles per interval to advance counters quickly
+    const CYCLES_PER_TICK = 8192;
+    const TICK_INTERVAL_MS = 16; // ~60fps
+
+    clkRef.current = 0;
+
+    const sim = gateSim;
+
+    // Core simulation: clock N cycles, return captured per-digit state
+    function simulateCycles(
+      count: number,
+      digitSeg: (number | null)[],
+      digitDpArr: (number | null)[],
+    ): Record<string, number> {
+      const mapping = portMappingRef.current;
+      const baseInputs = boardInputsRef.current;
+      let lastResult: Record<string, number> = {};
+
+      const risingInputs = mapping
+        ? boardInputsToUserPorts({ ...baseInputs, clk: 1 }, mapping)
+        : { ...baseInputs, clk: 1 };
+      const fallingInputs = mapping
+        ? boardInputsToUserPorts({ ...baseInputs, clk: 0 }, mapping)
+        : { ...baseInputs, clk: 0 };
+
+      for (let i = 0; i < count; i++) {
+        lastResult = sim.evaluate(risingInputs);
+
+        let an: number, seg: number, dp: number;
+        if (mapping) {
+          const boardOut = userOutputsToBoardOutputs(lastResult, mapping);
+          an = boardOut.an ?? 0xF;
+          seg = boardOut.seg ?? 0x7F;
+          dp = boardOut.dp ?? 1;
+        } else {
+          an = lastResult.an ?? 0xF;
+          seg = lastResult.seg ?? 0x7F;
+          dp = lastResult.dp ?? 1;
+        }
+
+        for (let d = 0; d < 4; d++) {
+          if (!((an >> d) & 1)) {
+            digitSeg[d] = seg;
+            digitDpArr[d] = dp;
+          }
+        }
+
+        lastResult = sim.evaluate(fallingInputs);
+      }
+      return lastResult;
+    }
+
+    // Flush captured digit state to React
+    function flushState(
+      digitSeg: (number | null)[],
+      digitDpArr: (number | null)[],
+      lastResult: Record<string, number>,
+    ) {
+      setDigitSegments(prev => {
+        const next = [...prev];
+        let changed = false;
+        for (let d = 0; d < 4; d++) {
+          const val = digitSeg[d];
+          if (val !== null && next[d] !== val) {
+            next[d] = val;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      setDigitDp(prev => {
+        const next = [...prev];
+        let changed = false;
+        for (let d = 0; d < 4; d++) {
+          const val = digitDpArr[d];
+          if (val !== null && next[d] !== val) {
+            next[d] = val;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      const mapping = portMappingRef.current;
+      const finalOut = mapping
+        ? userOutputsToBoardOutputs(lastResult, mapping)
+        : lastResult;
+      setOutputs(prev => {
+        const next = {
+          led: finalOut.led ?? 0,
+          seg: finalOut.seg ?? 0x7F,
+          dp: finalOut.dp ?? 1,
+          an: finalOut.an ?? 0xF,
+        };
+        if (prev.led === next.led && prev.seg === next.seg && prev.dp === next.dp && prev.an === next.an) return prev;
+        return next;
+      });
+    }
+
+    // Ongoing: clock continuously — digits appear progressively as
+    // counters advance. No synchronous warm-up to avoid blocking the UI.
+    const intervalId = setInterval(() => {
+      try {
+        const digitSeg: (number | null)[] = [null, null, null, null];
+        const digitDpArr: (number | null)[] = [null, null, null, null];
+        const lastResult = simulateCycles(CYCLES_PER_TICK, digitSeg, digitDpArr);
+        flushState(digitSeg, digitDpArr, lastResult);
+      } catch (e) {
+        console.warn('Board clock simulation error:', e);
+      }
+    }, TICK_INTERVAL_MS);
+
+    return () => clearInterval(intervalId);
+  }, [gateSim, hasClock]);
 
   const toggleSwitch = useCallback((idx: number) => {
     setSwitches(prev => {
@@ -181,7 +319,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
       <div className="flex flex-col items-center gap-4 p-4">
         {/* Board title & status */}
         <div className="flex items-center gap-3 w-[740px]">
-          <Badge variant="secondary" className="bg-blue-900/50 text-blue-400 border-blue-700">
+          <Badge variant="secondary" className="bg-muted text-muted-foreground border-border">
             Basys 3
           </Badge>
           <span className="text-xs text-muted-foreground">Artix-7 XC7A35T</span>
@@ -283,11 +421,18 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
              <span className="text-3xl font-bold text-white tracking-widest bg-[#1a365d] px-2 py-1 border-2 border-white rounded-md">BASYS 3</span>
           </div>
 
-          {/* Top Panel Connectors */}
-          <div className="absolute top-0 left-[90px] w-12 h-16 bg-zinc-900 flex flex-col justify-end p-2 border-b border-zinc-700">
+          {/* Power Slide Switch */}
+          <div
+            className="absolute top-0 left-[90px] w-12 h-16 bg-zinc-900 flex flex-col justify-end p-2 border-b border-zinc-700 cursor-pointer"
+            onClick={() => setPowerOn(prev => !prev)}
+          >
              <div className="text-[7px] text-center mb-1 text-white">POWER</div>
              <div className="w-full h-8 bg-black rounded-sm relative shadow-inner flex shrink-0">
-               <div className="absolute top-0 w-full h-1/2 bg-zinc-300 rounded-sm shadow-sm" />
+               <div className={`absolute w-full h-1/2 rounded-sm shadow-sm transition-all duration-150 ${
+                 powerOn
+                   ? 'top-0 bg-zinc-300'
+                   : 'bottom-0 bg-zinc-500'
+               }`} />
              </div>
           </div>
           <div className="absolute top-0 left-[160px] w-14 h-12 bg-zinc-300 border-b border-zinc-400 rounded-b-sm shadow-md flex justify-center">
@@ -359,9 +504,9 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
               {[3, 2, 1, 0].map(i => (
                 <SevenSegDisplay
                   key={i}
-                  segments={outputs.seg}
-                  dp={outputs.dp}
-                  active={!((outputs.an >> i) & 1)}
+                  segments={digitSegments[i]}
+                  dp={digitDp[i]}
+                  active={powerOn && digitSegments[i] !== 0x7F}
                 />
               ))}
             </div>
@@ -414,7 +559,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
           {/* LEDs Array */}
           <div className="absolute bottom-[70px] left-0 w-full px-[54px] flex justify-between flex-row-reverse">
              {Array.from({ length: 16 }, (_, i) => {
-               const isOn = (outputs.led >> i) & 1;
+               const isOn = powerOn && ((outputs.led >> i) & 1);
                return (
                  <Tooltip key={`led-${i}`}>
                    <TooltipTrigger>

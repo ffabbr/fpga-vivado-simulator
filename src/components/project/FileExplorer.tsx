@@ -200,7 +200,7 @@ export default function FileExplorer({
                             <span className="truncate text-xs">{file.name}</span>
                           )}
                           {topModule && file.type === 'verilog' && file.content.includes(`module ${topModule}`) && (
-                            <Badge variant="outline" className="h-4 text-[9px] px-1 border-blue-500/50 text-blue-500">
+                            <Badge variant="outline" className="h-4 text-[9px] px-1 border-muted-foreground/50 text-muted-foreground">
                               TOP
                             </Badge>
                           )}
@@ -298,7 +298,7 @@ export default function FileExplorer({
             <Spinner data-icon="inline-end" className="h-3 w-3" />
           </Badge>
         ) : topModule ? (
-          <Badge variant="outline" className="h-5 text-[10px] border-blue-500/30 text-blue-500">
+          <Badge variant="outline" className="h-5 text-[10px] border-muted-foreground/30 text-muted-foreground">
             <Cpu className="h-3 w-3 mr-1" /> {topModule}
           </Badge>
         ) : null}
