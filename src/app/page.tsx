@@ -5,7 +5,7 @@ import dynamic from 'next/dynamic';
 import { toast } from 'sonner';
 import {
   projectReducer, createDefaultProject, saveProject, loadProject,
-  generateMsgId, type ProjectFile, type ConsoleMessage,
+  generateMsgId, createFile, type ProjectFile, type ConsoleMessage,
 } from '@/lib/store';
 import { simulate, type SimulationResult } from '@/lib/verilog-simulator';
 import { parseVerilog } from '@/lib/verilog-parser';
@@ -489,6 +489,29 @@ export default function Home() {
                       activeFileId={state.activeFileId}
                       onSelectFile={(id) => dispatch({ type: 'SET_ACTIVE_FILE', id })}
                       onCloseFile={(id) => dispatch({ type: 'CLOSE_FILE', id })}
+                      onRenameFile={(id) => {
+                        const name = prompt('Rename file:', state.files.find(f => f.id === id)?.name);
+                        if (name?.trim()) dispatch({ type: 'RENAME_FILE', id, name: name.trim() });
+                      }}
+                      onDuplicateFile={(id) => {
+                        const file = state.files.find(f => f.id === id);
+                        if (!file) return;
+                        const ext = file.name.lastIndexOf('.');
+                        const base = ext > 0 ? file.name.slice(0, ext) : file.name;
+                        const extension = ext > 0 ? file.name.slice(ext) : '';
+                        const newFile = createFile(`${base}_copy${extension}`, file.content, file.type);
+                        dispatch({ type: 'ADD_FILE', file: newFile });
+                      }}
+                      onDeleteFile={(id) => dispatch({ type: 'DELETE_FILE', id })}
+                      onSetTopModule={(id) => {
+                        const file = state.files.find(f => f.id === id);
+                        if (!file) return;
+                        const match = file.content.match(/module\s+(\w+)/);
+                        if (match) {
+                          dispatch({ type: 'SET_TOP_MODULE', name: match[1] });
+                          addConsoleMsg('info', `Top module set to: ${match[1]}`, 'System');
+                        }
+                      }}
                     />
                     <div className="flex-1">
                       {activeFile ? (
