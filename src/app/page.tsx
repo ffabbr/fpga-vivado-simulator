@@ -4,7 +4,7 @@ import { useReducer, useCallback, useEffect, useState, useRef, useMemo } from 'r
 import dynamic from 'next/dynamic';
 import { toast } from 'sonner';
 import {
-  projectReducer, createDefaultProject, saveProject, loadProject,
+  projectReducer, createDefaultProject, createEmptyProject, saveProject, loadProject,
   generateMsgId, createFile, type ProjectFile, type ConsoleMessage,
 } from '@/lib/store';
 import { simulate, type SimulationResult } from '@/lib/verilog-simulator';
@@ -15,6 +15,7 @@ import Toolbar from '@/components/layout/Toolbar';
 import CommandMenu from '@/components/layout/CommandMenu';
 import EditorTabs from '@/components/layout/EditorTabs';
 import FileExplorer from '@/components/project/FileExplorer';
+import WelcomeDialog from '@/components/layout/WelcomeDialog';
 import ConsolePanel from '@/components/console/ConsolePanel';
 import { Button } from '@/components/ui/button';
 import { Trash2 } from 'lucide-react';
@@ -59,7 +60,7 @@ function detectLikelyTopModule(verilogFiles: ProjectFile[]): string | null {
 
 export default function Home() {
   const [state, dispatch] = useReducer(projectReducer, null, () => {
-    return createDefaultProject();
+    return createEmptyProject();
   });
 
   const [activeView, setActiveView] = useState<'editor' | 'board' | 'waveform'>('editor');
@@ -355,10 +356,17 @@ export default function Home() {
   }, [addConsoleMsg]);
 
   const handleNewProject = useCallback(() => {
-    const defaultState = createDefaultProject();
-    dispatch({ type: 'LOAD_PROJECT', state: defaultState });
+    const emptyState = createEmptyProject();
+    dispatch({ type: 'LOAD_PROJECT', state: emptyState });
     setSimulationResult(null);
     addConsoleMsg('info', 'New project created', 'System');
+  }, [addConsoleMsg]);
+
+  const handleLoadExample = useCallback(() => {
+    const exampleState = createDefaultProject();
+    dispatch({ type: 'LOAD_PROJECT', state: exampleState });
+    setSimulationResult(null);
+    addConsoleMsg('info', 'Example project loaded', 'System');
   }, [addConsoleMsg]);
 
   const getEditorLanguage = (file: ProjectFile | null) => {
@@ -405,6 +413,9 @@ export default function Home() {
         onChange={handleFileImport}
       />
 
+      {/* Welcome Dialog (first visit only) */}
+      <WelcomeDialog onLoadExample={handleLoadExample} />
+
       {/* Command Menu (Cmd+K) */}
       <CommandMenu
         open={commandMenuOpen}
@@ -423,6 +434,7 @@ export default function Home() {
         onStopSimulation={handleStopSimulation}
         onNewFile={() => setNewFileDialogOpen(true)}
         onNewProject={handleNewProject}
+        onLoadExample={handleLoadExample}
         onExportProject={handleExport}
         onImportProject={handleImport}
         onClearConsole={() => dispatch({ type: 'CLEAR_CONSOLE' })}
@@ -442,6 +454,7 @@ export default function Home() {
         onImportProject={handleImport}
         onNewProject={handleNewProject}
         onNewFile={() => setNewFileDialogOpen(true)}
+        onLoadExample={handleLoadExample}
         onOpenCommandMenu={() => setCommandMenuOpen(true)}
       />
 
@@ -614,6 +627,7 @@ export default function Home() {
       <div className="h-6 border-t border-border bg-muted/80 flex items-center justify-between px-3 text-[10px] text-muted-foreground">
         <div className="flex items-center gap-3">
           <span>FPGA Studio v1.0</span>
+          <a href="https://github.com/ffabbr/fpga-vivado-simulator" target="_blank" rel="noopener noreferrer" className="text-muted-foreground hover:text-foreground underline underline-offset-2">Contribute</a>
           <span>|</span>
           <span>Target: Basys 3 (XC7A35T-1CPG236C)</span>
           {state.topModule && (

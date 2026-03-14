@@ -15,7 +15,7 @@ import {
   FileCode2, TestTube2, Settings2, FileText,
   Zap, Play, Square, Sun, Moon,
   Download, Upload, FilePlus2, Cpu,
-  FileCode, Waves, LayoutGrid, Trash2,
+  FileCode, Waves, LayoutGrid, Trash2, BookOpen, FolderPlus,
 } from 'lucide-react';
 import type { ProjectFile } from '@/lib/store';
 
@@ -33,6 +33,7 @@ interface CommandMenuProps {
   onStopSimulation: () => void;
   onNewFile: () => void;
   onNewProject: () => void;
+  onLoadExample: () => void;
   onExportProject: () => void;
   onImportProject: () => void;
   onClearConsole: () => void;
@@ -60,6 +61,7 @@ export default function CommandMenu({
   onStopSimulation,
   onNewFile,
   onNewProject,
+  onLoadExample,
   onExportProject,
   onImportProject,
   onClearConsole,
@@ -200,8 +202,14 @@ export default function CommandMenu({
           <CommandItem
             onSelect={() => runAndClose(onNewProject)}
           >
-            <FileText className="h-4 w-4" />
+            <FolderPlus className="h-4 w-4" />
             <span>New Project</span>
+          </CommandItem>
+          <CommandItem
+            onSelect={() => runAndClose(onLoadExample)}
+          >
+            <BookOpen className="h-4 w-4" />
+            <span>Load Example</span>
           </CommandItem>
           <CommandItem
             onSelect={() => runAndClose(onImportProject)}

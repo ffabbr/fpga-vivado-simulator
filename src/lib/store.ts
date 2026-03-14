@@ -167,7 +167,20 @@ export function projectReducer(state: ProjectState, action: ProjectAction): Proj
   }
 }
 
-// Default project with example files
+// Empty project (used for new projects and first visit)
+export function createEmptyProject(): ProjectState {
+  return {
+    name: 'FPGA Project',
+    files: [],
+    activeFileId: null,
+    openFileIds: [],
+    consoleMessages: [],
+    topModule: null,
+    targetDevice: 'xc7a35tcpg236-1',
+  };
+}
+
+// Example project with sample files
 export function createDefaultProject(): ProjectState {
   const fullAdderFile = createFile('FullAdder.v', `\`timescale 1ns / 1ps
 

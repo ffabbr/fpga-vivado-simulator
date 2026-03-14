@@ -4,6 +4,7 @@ import {
   Play, Square, Download, Upload, Cpu, FilePlus2,
   FileCode2, Zap, LayoutGrid, Waves,
   Undo2, Redo2, Scissors, Copy, ClipboardPaste, Search,
+  FolderPlus, BookOpen,
 } from 'lucide-react';
 import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
@@ -29,13 +30,14 @@ interface ToolbarProps {
   onImportProject: () => void;
   onNewProject: () => void;
   onNewFile: () => void;
+  onLoadExample: () => void;
   onOpenCommandMenu: () => void;
 }
 
 export default function Toolbar({
   projectName, isSimulating, isSynthesizing, activeView,
   onRunSimulation, onStopSimulation, onSynthesize,
-  onSetView, onExportProject, onImportProject, onNewProject, onNewFile, onOpenCommandMenu,
+  onSetView, onExportProject, onImportProject, onNewProject, onNewFile, onLoadExample, onOpenCommandMenu,
 }: ToolbarProps) {
   const runEditorCommand = (commandId: string) => {
     const editor = window.__fpgaActiveEditor;
@@ -107,7 +109,12 @@ export default function Toolbar({
                 <FilePlus2 className="h-4 w-4 mr-2" /> New File
               </MenubarItem>
               <MenubarSeparator />
-              <MenubarItem onClick={onNewProject}>New Project</MenubarItem>
+              <MenubarItem onClick={onNewProject}>
+                <FolderPlus className="h-4 w-4 mr-2" /> New Project
+              </MenubarItem>
+              <MenubarItem onClick={onLoadExample}>
+                <BookOpen className="h-4 w-4 mr-2" /> Load Example
+              </MenubarItem>
               <MenubarSeparator />
               <MenubarItem onClick={onImportProject}>
                 <Upload className="h-4 w-4 mr-2" /> Import Project

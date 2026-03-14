@@ -324,7 +324,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
           </Badge>
           <span className="text-xs text-muted-foreground">Artix-7 XC7A35T</span>
           {gateSim ? (
-            <Badge variant="secondary" className="bg-green-900/50 text-green-400 border-green-700 text-[10px]">
+            <Badge variant="secondary" className="bg-green-100 text-green-700 border-green-300 dark:bg-green-900/50 dark:text-green-400 dark:border-green-700 text-[10px]">
               Synthesized
             </Badge>
           ) : (
@@ -341,29 +341,22 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
 
         {/* Synthesis prompt when no netlist */}
         {!gateSim && (
-          <div className="w-[740px] rounded-xl border border-blue-500/30 bg-card/80 px-4 py-4 shadow-lg shadow-blue-500/10 backdrop-blur-sm">
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-start gap-3">
-                <div className="mt-0.5 rounded-md border border-blue-500/40 bg-blue-500/10 p-2 text-blue-600 dark:text-blue-300">
-                  <Zap className="h-4 w-4" />
-                </div>
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-foreground">Synthesis Required</p>
-                  <p className="text-xs text-muted-foreground">Design must be synthesized to simulate on the board.</p>
-                </div>
-              </div>
+          <div className="w-[740px] flex items-center justify-between rounded-md border border-border bg-muted/50 px-3 py-2">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Zap className="h-3.5 w-3.5" />
+              <span>Synthesis required to simulate on the board</span>
+            </div>
             {onSynthesize && (
               <Button
                 size="sm"
-                variant="default"
-                className="bg-blue-600 hover:bg-blue-500 text-white"
+                variant="secondary"
+                className="h-7 text-xs"
                 onClick={onSynthesize}
                 disabled={isSynthesizing}
               >
-                {isSynthesizing ? 'Synthesizing...' : 'Synthesize Now'}
+                {isSynthesizing ? 'Synthesizing...' : 'Synthesize'}
               </Button>
             )}
-            </div>
           </div>
         )}
 
