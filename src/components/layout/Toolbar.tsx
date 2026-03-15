@@ -4,7 +4,7 @@ import {
   Play, Square, Download, Upload, Cpu, FilePlus2,
   FileCode2, Zap, LayoutGrid, Waves,
   Undo2, Redo2, Scissors, Copy, ClipboardPaste, Search,
-  FolderPlus, BookOpen,
+  FolderPlus, BookOpen, FolderArchive,
 } from 'lucide-react';
 import {
   Tooltip, TooltipContent, TooltipProvider, TooltipTrigger,
@@ -27,6 +27,7 @@ interface ToolbarProps {
   onSynthesize: () => void;
   onSetView: (view: 'editor' | 'board' | 'waveform') => void;
   onExportProject: () => void;
+  onExportZip: () => void;
   onImportProject: () => void;
   onNewProject: () => void;
   onNewFile: () => void;
@@ -37,7 +38,7 @@ interface ToolbarProps {
 export default function Toolbar({
   projectName, isSimulating, isSynthesizing, activeView,
   onRunSimulation, onStopSimulation, onSynthesize,
-  onSetView, onExportProject, onImportProject, onNewProject, onNewFile, onLoadExample, onOpenCommandMenu,
+  onSetView, onExportProject, onExportZip, onImportProject, onNewProject, onNewFile, onLoadExample, onOpenCommandMenu,
 }: ToolbarProps) {
   const runEditorCommand = (commandId: string) => {
     const editor = window.__fpgaActiveEditor;
@@ -98,6 +99,10 @@ export default function Toolbar({
     runEditorCommand('editor.action.selectHighlights');
   };
 
+  const doToggleComment = () => {
+    runEditorCommand('editor.action.commentLine');
+  };
+
   return (
     <TooltipProvider>
       <div className="flex items-center h-11 px-2 border-b border-border bg-background gap-1 relative">
@@ -121,10 +126,13 @@ export default function Toolbar({
               </MenubarItem>
               <MenubarSeparator />
               <MenubarItem onClick={onImportProject}>
-                <Upload className="h-4 w-4 mr-2" /> Import Project
+                <Download className="h-4 w-4 mr-2" /> Import Project
               </MenubarItem>
               <MenubarItem onClick={onExportProject}>
-                <Download className="h-4 w-4 mr-2" /> Export Project
+                <Upload className="h-4 w-4 mr-2" /> Export Project
+              </MenubarItem>
+              <MenubarItem onClick={onExportZip}>
+                <FolderArchive className="h-4 w-4 mr-2" /> Export as ZIP
               </MenubarItem>
             </MenubarContent>
           </MenubarMenu>
@@ -192,6 +200,11 @@ export default function Toolbar({
               <MenubarItem onClick={doSelectAllOccurrences}>
                 Select All Occurrences
                 <span className="ml-auto text-[10px] text-muted-foreground">Shift+Cmd/Ctrl+L</span>
+              </MenubarItem>
+              <MenubarSeparator />
+              <MenubarItem onClick={doToggleComment}>
+                Toggle Comment
+                <span className="ml-auto text-[10px] text-muted-foreground">Cmd/Ctrl+/</span>
               </MenubarItem>
             </MenubarContent>
           </MenubarMenu>

@@ -11,6 +11,7 @@ import { simulate, type SimulationResult } from '@/lib/verilog-simulator';
 import { parseVerilog } from '@/lib/verilog-parser';
 import { YosysClient } from '@/lib/yosys-client';
 import type { YosysNetlist } from '@/lib/gate-sim';
+import JSZip from 'jszip';
 import Toolbar from '@/components/layout/Toolbar';
 import CommandMenu from '@/components/layout/CommandMenu';
 import EditorTabs from '@/components/layout/EditorTabs';
@@ -333,6 +334,22 @@ export default function Home() {
     addConsoleMsg('info', 'Project exported', 'System');
   }, [state, addConsoleMsg]);
 
+  // Export project as ZIP
+  const handleExportZip = useCallback(async () => {
+    const zip = new JSZip();
+    for (const file of state.files) {
+      zip.file(file.name, file.content);
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${state.name.replace(/\s+/g, '_')}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addConsoleMsg('info', 'Project exported as ZIP', 'System');
+  }, [state, addConsoleMsg]);
+
   // Import project
   const handleImport = useCallback(() => {
     fileInputRef.current?.click();
@@ -436,6 +453,7 @@ export default function Home() {
         onNewProject={handleNewProject}
         onLoadExample={handleLoadExample}
         onExportProject={handleExport}
+        onExportZip={handleExportZip}
         onImportProject={handleImport}
         onClearConsole={() => dispatch({ type: 'CLEAR_CONSOLE' })}
       />
@@ -451,6 +469,7 @@ export default function Home() {
         onSynthesize={handleSynthesize}
         onSetView={setActiveView}
         onExportProject={handleExport}
+        onExportZip={handleExportZip}
         onImportProject={handleImport}
         onNewProject={handleNewProject}
         onNewFile={() => setNewFileDialogOpen(true)}

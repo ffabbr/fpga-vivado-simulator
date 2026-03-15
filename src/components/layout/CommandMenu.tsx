@@ -15,7 +15,7 @@ import {
   FileCode2, TestTube2, Settings2, FileText,
   Zap, Play, Square, Sun, Moon,
   Download, Upload, FilePlus2, Cpu,
-  FileCode, Waves, LayoutGrid, Trash2, BookOpen, FolderPlus, Highlighter,
+  FileCode, Waves, LayoutGrid, Trash2, BookOpen, FolderPlus, Highlighter, MessageSquareOff, FolderArchive,
 } from 'lucide-react';
 import type { ProjectFile } from '@/lib/store';
 
@@ -35,6 +35,7 @@ interface CommandMenuProps {
   onNewProject: () => void;
   onLoadExample: () => void;
   onExportProject: () => void;
+  onExportZip: () => void;
   onImportProject: () => void;
   onClearConsole: () => void;
 }
@@ -63,6 +64,7 @@ export default function CommandMenu({
   onNewProject,
   onLoadExample,
   onExportProject,
+  onExportZip,
   onImportProject,
   onClearConsole,
 }: CommandMenuProps) {
@@ -164,6 +166,20 @@ export default function CommandMenu({
             <span>Select All Occurrences</span>
             <CommandShortcut>Shift+Cmd+L</CommandShortcut>
           </CommandItem>
+          <CommandItem
+            onSelect={() => runAndClose(() => {
+              const editor = window.__fpgaActiveEditor;
+              if (!editor) return;
+              requestAnimationFrame(() => {
+                editor.focus();
+                editor.trigger('commandMenu', 'editor.action.commentLine', null);
+              });
+            })}
+          >
+            <MessageSquareOff className="h-4 w-4" />
+            <span>Toggle Comment</span>
+            <CommandShortcut>Cmd+/</CommandShortcut>
+          </CommandItem>
         </CommandGroup>
 
         <CommandSeparator />
@@ -236,6 +252,12 @@ export default function CommandMenu({
           >
             <Download className="h-4 w-4" />
             <span>Export Project</span>
+          </CommandItem>
+          <CommandItem
+            onSelect={() => runAndClose(onExportZip)}
+          >
+            <FolderArchive className="h-4 w-4" />
+            <span>Export as ZIP</span>
           </CommandItem>
         </CommandGroup>
       </CommandList>

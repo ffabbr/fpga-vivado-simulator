@@ -76,6 +76,11 @@ export default function CodeEditor({ value, onChange, language, readOnly = false
           ],
         },
       } as Monaco.languages.IMonarchLanguage);
+      monaco.languages.setLanguageConfiguration('xdc', {
+        comments: {
+          lineComment: '#',
+        },
+      });
     }
 
     // Define both themes
