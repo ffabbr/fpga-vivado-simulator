@@ -553,11 +553,12 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
           <div className="absolute bottom-[70px] left-0 w-full px-[54px] flex justify-between flex-row-reverse">
              {Array.from({ length: 16 }, (_, i) => {
                const isOn = powerOn && ((outputs.led >> i) & 1);
+               const ledPortNames = ['U16','E19','U19','V19','W18','U15','U14','V14','V13','V3','W3','U3','P3','N3','P1','L1'];
                return (
                  <Tooltip key={`led-${i}`}>
                    <TooltipTrigger>
                      <div className="flex flex-col items-center gap-1 w-8">
-                       <span className="text-[8px] font-bold text-white mb-1">LD{i}</span>
+                       <span className="text-[8px] font-bold text-white mb-1">{ledPortNames[i]}</span>
                        <div
                          className={`w-3 h-2 rounded-[1px] transition-all duration-75 shadow-sm ${
                            isOn
