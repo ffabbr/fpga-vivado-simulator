@@ -42,8 +42,12 @@ export default function Toolbar({
   const runEditorCommand = (commandId: string) => {
     const editor = window.__fpgaActiveEditor;
     if (!editor) return;
-    editor.focus();
-    editor.trigger('toolbar', commandId, null);
+    // Defer until the menu has fully closed so its focus management
+    // doesn't steal focus back from the editor after we focus it.
+    requestAnimationFrame(() => {
+      editor.focus();
+      editor.trigger('toolbar', commandId, null);
+    });
   };
 
   const doUndo = () => {

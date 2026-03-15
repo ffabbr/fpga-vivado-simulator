@@ -177,6 +177,17 @@ export default function CodeEditor({ value, onChange, language, readOnly = false
       },
     });
 
+    // Override Cmd/Ctrl+K so it reaches the document-level CommandMenu listener
+    // instead of being consumed by Monaco's chord keybinding system
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'k',
+        metaKey: true,
+        ctrlKey: true,
+        bubbles: true,
+      }));
+    });
+
     editor.updateOptions({
       fontSize: 13,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",

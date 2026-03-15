@@ -15,7 +15,7 @@ import {
   FileCode2, TestTube2, Settings2, FileText,
   Zap, Play, Square, Sun, Moon,
   Download, Upload, FilePlus2, Cpu,
-  FileCode, Waves, LayoutGrid, Trash2, BookOpen, FolderPlus,
+  FileCode, Waves, LayoutGrid, Trash2, BookOpen, FolderPlus, Highlighter,
 } from 'lucide-react';
 import type { ProjectFile } from '@/lib/store';
 
@@ -149,6 +149,20 @@ export default function CommandMenu({
           >
             <Trash2 className="h-4 w-4" />
             <span>Clear Console</span>
+          </CommandItem>
+          <CommandItem
+            onSelect={() => runAndClose(() => {
+              const editor = window.__fpgaActiveEditor;
+              if (!editor) return;
+              requestAnimationFrame(() => {
+                editor.focus();
+                editor.trigger('commandMenu', 'editor.action.selectHighlights', null);
+              });
+            })}
+          >
+            <Highlighter className="h-4 w-4" />
+            <span>Select All Occurrences</span>
+            <CommandShortcut>Shift+Cmd+L</CommandShortcut>
           </CommandItem>
         </CommandGroup>
 
