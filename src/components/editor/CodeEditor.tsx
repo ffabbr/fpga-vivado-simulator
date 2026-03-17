@@ -4,6 +4,12 @@ import { useRef, useCallback, useEffect, useState } from 'react';
 import Editor, { OnMount } from '@monaco-editor/react';
 import { verilogLanguageConfig, verilogTokensProvider, verilogDarkTheme, verilogLightTheme } from '@/lib/verilog-language';
 import type * as Monaco from 'monaco-editor';
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from '@/components/ui/context-menu';
 
 declare global {
   interface Window {
@@ -21,11 +27,19 @@ interface CodeEditorProps {
 export default function CodeEditor({ value, onChange, language, readOnly = false }: CodeEditorProps) {
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
-  const [isDark, setIsDark] = useState(true);
+  const [isDark, setIsDark] = useState(() =>
+    typeof document !== 'undefined' ? document.documentElement.classList.contains('dark') : true
+  );
+
+  const runEditorCommand = useCallback((commandId: string) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    editor.focus();
+    editor.trigger('context-menu', commandId, null);
+  }, []);
 
   // Watch for theme changes on <html> class
   useEffect(() => {
-    setIsDark(document.documentElement.classList.contains('dark'));
     const observer = new MutationObserver(() => {
       const dark = document.documentElement.classList.contains('dark');
       setIsDark(dark);
@@ -206,6 +220,7 @@ export default function CodeEditor({ value, onChange, language, readOnly = false
       automaticLayout: true,
       bracketPairColorization: { enabled: true },
       guides: { bracketPairs: true },
+      contextmenu: false,
       readOnly,
     });
   }, [readOnly]);
@@ -223,20 +238,41 @@ export default function CodeEditor({ value, onChange, language, readOnly = false
   }, [detectedLang]);
 
   return (
-    <div className="h-full w-full">
-      <Editor
-        height="100%"
-        defaultLanguage={detectedLang}
-        value={value}
-        onChange={(v) => onChange(v || '')}
-        onMount={handleEditorMount}
-        theme={isDark ? 'vivado-dark' : 'vivado-light'}
-        loading={
-          <div className="flex items-center justify-center h-full bg-background text-muted-foreground">
-            Loading editor...
-          </div>
-        }
-      />
-    </div>
+    <ContextMenu>
+      <ContextMenuTrigger className="h-full w-full">
+        <div className="h-full w-full">
+          <Editor
+            height="100%"
+            defaultLanguage={detectedLang}
+            value={value}
+            onChange={(v) => onChange(v || '')}
+            onMount={handleEditorMount}
+            theme={isDark ? 'vivado-dark' : 'vivado-light'}
+            loading={
+              <div className="flex items-center justify-center h-full bg-background text-muted-foreground">
+                Loading editor...
+              </div>
+            }
+          />
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={() => runEditorCommand('editor.action.changeAll')}>
+          Change All Occurrences
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => runEditorCommand('editor.action.clipboardCutAction')}>
+          Cut
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => runEditorCommand('editor.action.clipboardCopyAction')}>
+          Copy
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => runEditorCommand('editor.action.clipboardPasteAction')}>
+          Paste
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => runEditorCommand('editor.action.quickCommand')}>
+          Command Palette
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
