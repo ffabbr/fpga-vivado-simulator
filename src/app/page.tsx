@@ -22,7 +22,7 @@ import { Button } from '@/components/ui/button';
 import { Trash2, Check, X } from 'lucide-react';
 import WaveformViewer from '@/components/waveform/WaveformViewer';
 import SchematicViewer, { type SchematicEdgeDiff } from '@/components/schematic/SchematicViewer';
-import { computeProposedSource, computeLineDiff, type DiffLine } from '@/lib/verilog-codegen';
+import { computeAddedEdgePreviewLabels, computeProposedSource, computeLineDiff, type DiffLine } from '@/lib/verilog-codegen';
 import CodeReviewPanel from '@/components/schematic/CodeReviewPanel';
 import {
   ResizableHandle, ResizablePanel, ResizablePanelGroup,
@@ -81,6 +81,7 @@ export default function Home() {
     targetFileName: string;
     newSource: string;
     changeCount: number;
+    previewEdgeLabels: Record<string, string>;
   } | null>(null);
   const [newFileDialogOpen, setNewFileDialogOpen] = useState(false);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
@@ -457,6 +458,7 @@ export default function Home() {
 
     const lineDiff = computeLineDiff(targetFile.content, newSource);
     const changeCount = lineDiff.filter(d => d.type !== 'unchanged').length;
+    const previewEdgeLabels = computeAddedEdgePreviewLabels(diff, targetModule, allModules);
 
     setPendingSchematicEdits({
       diff: lineDiff,
@@ -464,6 +466,7 @@ export default function Home() {
       targetFileName: targetFile.name,
       newSource,
       changeCount,
+      previewEdgeLabels,
     });
   }, [state.files, schematicParseResults]);
 
@@ -478,6 +481,20 @@ export default function Home() {
     setPendingSchematicEdits(null);
     setSchematicResetKey(k => k + 1);
   }, []);
+
+  const handleNavigateSchematicModule = useCallback((moduleName: string) => {
+    setSchematicRequestedModule(moduleName);
+
+    const targetFile = state.files.find((file) => {
+      if (file.type !== 'verilog' && file.type !== 'testbench') return false;
+      const parsed = parseVerilog(file.content);
+      return parsed.modules.some((mod) => mod.name === moduleName);
+    });
+
+    if (targetFile) {
+      dispatch({ type: 'OPEN_FILE', id: targetFile.id });
+    }
+  }, [state.files]);
 
   const getEditorLanguage = (file: ProjectFile | null) => {
     if (!file) return 'verilog';
@@ -683,6 +700,8 @@ export default function Home() {
                     contentKey={verilogContentKey}
                     requestedModuleName={schematicRequestedModule}
                     resetKey={schematicResetKey}
+                    previewEdgeLabels={pendingSchematicEdits?.previewEdgeLabels ?? null}
+                    onNavigateToModule={handleNavigateSchematicModule}
                     onEdgeDiffChange={handleSchematicEdgeDiff}
                     onConsoleMessage={addConsoleMsg}
                   />

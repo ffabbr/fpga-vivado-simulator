@@ -107,7 +107,7 @@ export default function Toolbar({
     <TooltipProvider>
       <div className="flex items-center h-11 px-2 border-b border-border bg-background gap-1 relative">
         {/* App name */}
-        <span className="text-sm font-bold text-foreground tracking-tight mr-2">FPGA Studio</span>
+        <span className="text-sm font-bold text-foreground tracking-tight mr-2 max-[969px]:hidden">FPGA Studio</span>
 
         {/* Menubar: File + Edit + Flow */}
         <Menubar className="h-7 border-none p-0 gap-0">

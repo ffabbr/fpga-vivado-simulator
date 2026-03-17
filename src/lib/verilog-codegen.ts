@@ -57,6 +57,35 @@ export interface DiffLine {
   line: string;
 }
 
+function createGeneratedSignalAllocator(existingSignals: Iterable<string>) {
+  const existing = new Set(existingSignals);
+  const allocated = new Set<string>();
+  let autoWireCounter = 0;
+
+  function nextAutoWireName(): string {
+    let candidate = `w_auto_${autoWireCounter++}`;
+    while (existing.has(candidate) || allocated.has(candidate)) {
+      candidate = `w_auto_${autoWireCounter++}`;
+    }
+    allocated.add(candidate);
+    return candidate;
+  }
+
+  return (edge: Pick<SchematicEdgeInfo, 'label'>): string => {
+    const preferred = edge.label?.trim();
+    if (preferred && /^[A-Za-z_]\w*$/.test(preferred)) {
+      if (existing.has(preferred)) return preferred;
+      allocated.add(preferred);
+      return preferred;
+    }
+    return nextAutoWireName();
+  };
+}
+
+function isValidSignalName(name: string | undefined): name is string {
+  return !!name && /^[A-Za-z_]\w*$/.test(name);
+}
+
 // ── Node ID helpers ─────────────────────────────────────────────────────────
 
 type NodeKind = 'port-in' | 'port-out' | 'inst' | 'gate' | 'assign' | 'always' | 'unknown';
@@ -162,10 +191,11 @@ export function computeProposedSource(
 
   // ── Shared helpers (used across multiple phases) ────────────────────────
   const newNodeSignals = new Map<string, Map<string, string>>();
-  let autoWireCounter = 0;
   const touchedGateArgs = new Map<number, Set<string>>();
   const extraWires = new Set<string>();
   const gateDesired = new Map<number, { output: string; inputs: string[] }>();
+  const allocGeneratedSignalName = createGeneratedSignalAllocator(knownSignals);
+  const preferredGeneratedSignalNames = new Map<string, string>();
 
   function getNewNodeSignalMap(nodeId: string): Map<string, string> {
     let map = newNodeSignals.get(nodeId);
@@ -173,8 +203,23 @@ export function computeProposedSource(
     return map;
   }
 
-  function genWireName(): string {
-    return `w_auto_${autoWireCounter++}`;
+  for (const edge of edgeDiff.added) {
+    const key = `${edge.source}::${edge.sourceHandle || ''}`;
+    const preferred = edge.label?.trim();
+    if (isValidSignalName(preferred)) {
+      preferredGeneratedSignalNames.set(key, preferred);
+    }
+  }
+
+  function getOrCreateGeneratedSignal(nodeId: string, handle: string | undefined, edge: Pick<SchematicEdgeInfo, 'label'>): string {
+    const handleKey = handle ?? '';
+    const signals = getNewNodeSignalMap(nodeId);
+    const existing = signals.get(handleKey);
+    if (existing) return existing;
+    const preferred = preferredGeneratedSignalNames.get(`${nodeId}::${handleKey}`);
+    const next = allocGeneratedSignalName({ label: preferred ?? edge.label });
+    signals.set(handleKey, next);
+    return next;
   }
 
   function markTouched(gi: number, handle: string) {
@@ -223,7 +268,7 @@ export function computeProposedSource(
       const srcHandleKey = `${edge.source}::${edge.sourceHandle || ''}`;
       if (removedSourceHandles.has(srcHandleKey)) {
         // Source handle is being disconnected from something else → use auto-wire
-        const wire = genWireName();
+        const wire = getOrCreateGeneratedSignal(edge.source, edge.sourceHandle, edge);
         if (edge.targetHandle) getNewNodeSignalMap(edge.target).set(edge.targetHandle, wire);
         // Also pre-set the gate's desired output to this wire
         const srcGi = gateIndexFromNodeId(edge.source);
@@ -241,7 +286,7 @@ export function computeProposedSource(
 
     if (srcIsNew && tgtIsNew) {
       // Both new: generate a connecting wire
-      const wireName = genWireName();
+      const wireName = getOrCreateGeneratedSignal(edge.source, edge.sourceHandle, edge);
       if (edge.sourceHandle) getNewNodeSignalMap(edge.source).set(edge.sourceHandle, wireName);
       if (edge.targetHandle) getNewNodeSignalMap(edge.target).set(edge.targetHandle, wireName);
     }
@@ -257,7 +302,7 @@ export function computeProposedSource(
         // New node → existing non-port: generate auto-wire
         const existingMapping = getNewNodeSignalMap(edge.source).get(edge.sourceHandle);
         if (!existingMapping) {
-          getNewNodeSignalMap(edge.source).set(edge.sourceHandle, genWireName());
+          getNewNodeSignalMap(edge.source).set(edge.sourceHandle, getOrCreateGeneratedSignal(edge.source, edge.sourceHandle, edge));
         }
       }
     }
@@ -432,7 +477,7 @@ export function computeProposedSource(
     // For touched empty args (explicitly disconnected), generate an auto-wire.
     if (!desired.output) {
       if (touched && touched.has('out')) {
-        const wire = genWireName();
+        const wire = allocGeneratedSignalName({});
         desired.output = wire;
         extraWires.add(wire);
       } else {
@@ -442,7 +487,7 @@ export function computeProposedSource(
     for (let i = 0; i < desired.inputs.length; i++) {
       if (!desired.inputs[i]) {
         if (touched && touched.has(`in-${i}`)) {
-          const wire = genWireName();
+          const wire = allocGeneratedSignalName({});
           desired.inputs[i] = wire;
           extraWires.add(wire);
         } else {
@@ -480,10 +525,8 @@ export function computeProposedSource(
     const newWires = new Set<string>(extraWires);
 
     for (const node of addedNodes) {
-      const signals = newNodeSignals.get(node.nodeId);
-      if (!signals || signals.size === 0) continue; // skip unconnected
-
       if (node.type === 'gate' && node.gateType) {
+        const signals = newNodeSignals.get(node.nodeId) ?? new Map<string, string>();
         const inputCount = node.inputCount ?? 2;
         const instName = `${node.gateType}_g${gateCounter++}`;
         const outSignal = signals.get('out') || `${instName}_out`;
@@ -500,6 +543,8 @@ export function computeProposedSource(
         lines.push(`  ${node.gateType} ${instName}(${outSignal}, ${inSignals.join(', ')});`);
 
       } else if (node.type === 'instance' && node.moduleName) {
+        const signals = newNodeSignals.get(node.nodeId);
+        if (!signals || signals.size === 0) continue; // skip unconnected instances
         const childMod = moduleMap.get(node.moduleName);
         const instName = `${node.moduleName}_i${instCounter++}`;
         const portList = childMod?.ports ?? [];
@@ -516,21 +561,14 @@ export function computeProposedSource(
       }
     }
 
-    // Add wire declarations before gate/instance lines
+    // Add wire declarations in the module declaration section so they appear
+    // before any newly rewired existing logic that may already use them.
     const wireDecls = Array.from(newWires).map(w => `  wire ${w};`);
-    const allNewLines = [...wireDecls, ...lines];
-
-    if (allNewLines.length > 0) {
-      // Find the module in the (possibly modified) source by its declaration,
-      // then locate the next `endmodule` after it.
-      const modDeclPattern = new RegExp(`\\bmodule\\s+${escapeRegex(targetModule.name)}\\b`);
-      const modDeclMatch = modDeclPattern.exec(source);
-      if (modDeclMatch && modDeclMatch.index !== undefined) {
-        const endIdx = source.indexOf('endmodule', modDeclMatch.index);
-        if (endIdx >= 0) {
-          source = source.slice(0, endIdx) + allNewLines.join('\n') + '\n' + source.slice(endIdx);
-        }
-      }
+    if (wireDecls.length > 0) {
+      source = insertWireDeclarations(source, targetModule.name, wireDecls);
+    }
+    if (lines.length > 0) {
+      source = insertModuleStatements(source, targetModule.name, lines);
     }
   }
 
@@ -579,6 +617,110 @@ export function computeProposedSource(
   return source;
 }
 
+export function computeAddedEdgePreviewLabels(
+  edgeDiff: EdgeDiff,
+  targetModule: VerilogModule,
+  allModules: VerilogModule[],
+): Record<string, string> {
+  const deletedNodeIds = new Set((edgeDiff.deletedNodes ?? []).map(n => n.nodeId));
+  const newNodeIds = new Set((edgeDiff.addedNodes ?? []).map(n => n.nodeId));
+  const knownSignals = new Set([
+    ...targetModule.ports.map(p => p.name),
+    ...targetModule.wires.map(w => w.name),
+    ...targetModule.regs.map(r => r.name),
+  ]);
+  const newNodeSignals = new Map<string, Map<string, string>>();
+  const allocGeneratedSignalName = createGeneratedSignalAllocator(knownSignals);
+  const preferredGeneratedSignalNames = new Map<string, string>();
+
+  function getNewNodeSignalMap(nodeId: string): Map<string, string> {
+    let map = newNodeSignals.get(nodeId);
+    if (!map) {
+      map = new Map();
+      newNodeSignals.set(nodeId, map);
+    }
+    return map;
+  }
+
+  for (const edge of edgeDiff.added) {
+    const key = `${edge.source}::${edge.sourceHandle || ''}`;
+    const preferred = edge.label?.trim();
+    if (isValidSignalName(preferred)) {
+      preferredGeneratedSignalNames.set(key, preferred);
+    }
+  }
+
+  function getOrCreateGeneratedSignal(nodeId: string, handle: string | undefined, edge: Pick<SchematicEdgeInfo, 'label'>): string {
+    const handleKey = handle ?? '';
+    const signals = getNewNodeSignalMap(nodeId);
+    const existing = signals.get(handleKey);
+    if (existing) return existing;
+    const preferred = preferredGeneratedSignalNames.get(`${nodeId}::${handleKey}`);
+    const next = allocGeneratedSignalName({ label: preferred ?? edge.label });
+    signals.set(handleKey, next);
+    return next;
+  }
+
+  const removedSourceHandles = new Set<string>();
+  for (const edge of edgeDiff.removed) {
+    removedSourceHandles.add(`${edge.source}::${edge.sourceHandle || ''}`);
+  }
+
+  for (const edge of edgeDiff.added) {
+    const srcIsNew = newNodeIds.has(edge.source);
+    const tgtIsNew = newNodeIds.has(edge.target);
+    if (deletedNodeIds.has(edge.source) || deletedNodeIds.has(edge.target)) continue;
+
+    if (!srcIsNew && tgtIsNew && edge.targetHandle) {
+      const srcHandleKey = `${edge.source}::${edge.sourceHandle || ''}`;
+      if (removedSourceHandles.has(srcHandleKey)) {
+        getNewNodeSignalMap(edge.target).set(edge.targetHandle, getOrCreateGeneratedSignal(edge.source, edge.sourceHandle, edge));
+      } else {
+        const sig = resolveSignal(edge.source, edge.sourceHandle, targetModule, allModules);
+        if (sig) getNewNodeSignalMap(edge.target).set(edge.targetHandle, sig);
+      }
+    }
+
+    if (srcIsNew && tgtIsNew) {
+      const wireName = getOrCreateGeneratedSignal(edge.source, edge.sourceHandle, edge);
+      if (edge.sourceHandle) getNewNodeSignalMap(edge.source).set(edge.sourceHandle, wireName);
+      if (edge.targetHandle) getNewNodeSignalMap(edge.target).set(edge.targetHandle, wireName);
+    }
+
+    if (srcIsNew && !tgtIsNew && edge.sourceHandle) {
+      const tgtParsed = parseNodeId(edge.target);
+      if (tgtParsed.kind === 'port-out' || tgtParsed.kind === 'port-in') {
+        getNewNodeSignalMap(edge.source).set(edge.sourceHandle, tgtParsed.name);
+      } else if (!getNewNodeSignalMap(edge.source).has(edge.sourceHandle)) {
+        getNewNodeSignalMap(edge.source).set(edge.sourceHandle, getOrCreateGeneratedSignal(edge.source, edge.sourceHandle, edge));
+      }
+    }
+  }
+
+  const labels: Record<string, string> = {};
+  for (const edge of edgeDiff.added) {
+    if (deletedNodeIds.has(edge.source) || deletedNodeIds.has(edge.target)) continue;
+
+    const srcIsNew = newNodeIds.has(edge.source);
+    const tgtIsNew = newNodeIds.has(edge.target);
+    const key = `${edge.source}:${edge.sourceHandle || ''}->${edge.target}:${edge.targetHandle || ''}`;
+
+    let signal: string | null = null;
+    if (srcIsNew) {
+      signal = getNewNodeSignalMap(edge.source).get(edge.sourceHandle ?? '') ?? null;
+    } else if (tgtIsNew) {
+      signal = getNewNodeSignalMap(edge.target).get(edge.targetHandle ?? '') ??
+        resolveSignal(edge.source, edge.sourceHandle, targetModule, allModules);
+    } else {
+      signal = resolveSignal(edge.source, edge.sourceHandle, targetModule, allModules);
+    }
+
+    if (signal) labels[key] = signal;
+  }
+
+  return labels;
+}
+
 // ── Source text manipulation helpers ─────────────────────────────────────────
 
 function replaceInstanceConnection(
@@ -624,6 +766,58 @@ function replaceAssignExpression(
     `(assign\\s+${escapeRegex(target)}\\s*=\\s*)${escapeRegex(oldExpr)}(\\s*;)`,
   );
   return source.replace(pattern, `$1${newExpr}$2`);
+}
+
+function insertWireDeclarations(
+  source: string,
+  moduleName: string,
+  wireDecls: string[],
+): string {
+  const modDeclPattern = new RegExp(`\\bmodule\\s+${escapeRegex(moduleName)}\\b`);
+  const modDeclMatch = modDeclPattern.exec(source);
+  if (!modDeclMatch || modDeclMatch.index === undefined) return source;
+
+  const headerEndIdx = source.indexOf(';', modDeclMatch.index);
+  const endIdx = source.indexOf('endmodule', modDeclMatch.index);
+  if (headerEndIdx < 0 || endIdx < 0 || headerEndIdx > endIdx) return source;
+
+  const body = source.slice(headerEndIdx + 1, endIdx);
+  const lines = body.match(/[^\n]*\n?|$/g) ?? [];
+  let offset = 0;
+
+  for (const line of lines) {
+    if (!line) continue;
+    const trimmed = line.trim();
+    if (
+      trimmed === '' ||
+      trimmed.startsWith('//') ||
+      trimmed.startsWith('/*') ||
+      trimmed.startsWith('*') ||
+      /^(input|output|inout|wire|reg|integer|parameter|localparam)\b/.test(trimmed)
+    ) {
+      offset += line.length;
+      continue;
+    }
+    break;
+  }
+
+  const insertAt = headerEndIdx + 1 + offset;
+  return source.slice(0, insertAt) + wireDecls.join('\n') + '\n' + source.slice(insertAt);
+}
+
+function insertModuleStatements(
+  source: string,
+  moduleName: string,
+  statements: string[],
+): string {
+  const modDeclPattern = new RegExp(`\\bmodule\\s+${escapeRegex(moduleName)}\\b`);
+  const modDeclMatch = modDeclPattern.exec(source);
+  if (!modDeclMatch || modDeclMatch.index === undefined) return source;
+
+  const endIdx = source.indexOf('endmodule', modDeclMatch.index);
+  if (endIdx < 0) return source;
+
+  return source.slice(0, endIdx) + statements.join('\n') + '\n' + source.slice(endIdx);
 }
 
 /**

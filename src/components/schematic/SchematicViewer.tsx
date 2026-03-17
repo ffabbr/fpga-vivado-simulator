@@ -53,6 +53,7 @@ import { toast } from 'sonner';
 // Lazy-loaded netlistsvg module + skin cache
 let netlistSvgModule: { render(skin: string, netlist: object): Promise<string> } | null = null;
 let skinCache: string | null = null;
+const SCHEMATIC_EDGE_LABEL_STYLE = { fontSize: 9, fill: '#888' };
 
 async function getNetlistSvg() {
   if (!netlistSvgModule) {
@@ -77,12 +78,17 @@ export interface SchematicEdgeDiff {
   renamedGates: RenamedGate[];
 }
 
+export function schematicEdgeKey(edge: Pick<Edge, 'source' | 'sourceHandle' | 'target' | 'targetHandle'>): string {
+  return `${edge.source}:${edge.sourceHandle || ''}->${edge.target}:${edge.targetHandle || ''}`;
+}
+
 interface SchematicViewerProps {
   parseResults: ParseResult[];
   topModuleName: string | null;
   contentKey?: string; // changes when verilog source changes → resets cached positions
   requestedModuleName?: string | null; // external module selection (e.g. sidebar file click)
   resetKey?: number; // increment to force re-build from source (e.g. after reject)
+  previewEdgeLabels?: Record<string, string> | null;
   onNavigateToModule?: (moduleName: string) => void;
   onEdgeDiffChange?: (diff: SchematicEdgeDiff, moduleName: string) => void;
   onConsoleMessage?: (type: 'info' | 'error' | 'success' | 'warning', message: string, source?: string) => void;
@@ -634,7 +640,7 @@ function estimateHeight(node: Node): number {
 
 // ── Graph Builder ────────────────────────────────────────────────────────────
 
-function buildGraph(
+export function buildGraph(
   targetModule: VerilogModule,
   allModules: VerilogModule[],
 ): { nodes: Node[]; edges: Edge[] } {
@@ -875,7 +881,7 @@ function buildGraph(
       type: 'default',
       animated: false,
       style: { strokeWidth: 1.5 },
-      labelStyle: { fontSize: 9, fill: '#888' },
+      labelStyle: SCHEMATIC_EDGE_LABEL_STYLE,
       markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12 },
     });
   }
@@ -910,7 +916,7 @@ function buildGraph(
   }
   for (const e of edges) {
     const sk = `${e.source}:${e.sourceHandle || ''}`;
-    if ((sourceFanOut.get(sk) || 0) > 1) {
+    if ((sourceFanOut.get(sk) || 0) > 1 && !e.source.startsWith('port-')) {
       (e as Edge & { markerStart?: string }).markerStart = 'schematic-junction-dot';
     }
   }
@@ -957,6 +963,7 @@ function SchematicViewerInner({
   contentKey,
   requestedModuleName,
   resetKey,
+  previewEdgeLabels,
   onNavigateToModule,
   onEdgeDiffChange,
   onConsoleMessage,
@@ -975,7 +982,7 @@ function SchematicViewerInner({
   const nodeContextMenuFiredRef = useRef(false);
   const edgeContextMenuFiredRef = useRef(false);
   const [renameEdge, setRenameEdge] = useState<Edge | null>(null);
-  const [renameGateNode, setRenameGateNode] = useState<Node | null>(null);
+  const [renameNode, setRenameNode] = useState<Node | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [netlistSvg, setNetlistSvg] = useState<string | null>(null);
   const [isRenderingNetlist, setIsRenderingNetlist] = useState(false);
@@ -990,6 +997,7 @@ function SchematicViewerInner({
   const reactFlowInstance = useReactFlow();
   const baselineEdgesRef = useRef<Edge[]>([]);
   const baselineNodesRef = useRef<Node[]>([]);
+  const lastReportedDiffRef = useRef<string>('');
 
   const allModules = useMemo(() => {
     const modules: VerilogModule[] = [];
@@ -1075,28 +1083,48 @@ function SchematicViewerInner({
       id: `user-e-${Date.now()}`,
       type: fluidEdges ? 'default' : 'step',
       style: { strokeWidth: 1.5 },
+      labelStyle: SCHEMATIC_EDGE_LABEL_STYLE,
       markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12 },
     }, eds));
   }, [setEdges, fluidEdges]);
+
+  useEffect(() => {
+    if (!previewEdgeLabels || Object.keys(previewEdgeLabels).length === 0) return;
+
+    setEdges((currentEdges) => {
+      let changed = false;
+      const nextEdges = currentEdges.map((edge) => {
+        const previewLabel = previewEdgeLabels[schematicEdgeKey(edge)];
+        const needsLabel = !!previewLabel && edge.label !== previewLabel;
+        const needsStyle = edge.labelStyle !== SCHEMATIC_EDGE_LABEL_STYLE &&
+          (!edge.labelStyle ||
+            edge.labelStyle.fontSize !== SCHEMATIC_EDGE_LABEL_STYLE.fontSize ||
+            edge.labelStyle.fill !== SCHEMATIC_EDGE_LABEL_STYLE.fill);
+        if (!needsLabel && !needsStyle) return edge;
+        changed = true;
+        return { ...edge, label: previewLabel ?? edge.label, labelStyle: SCHEMATIC_EDGE_LABEL_STYLE };
+      });
+      return changed ? nextEdges : currentEdges;
+    });
+  }, [previewEdgeLabels, setEdges]);
 
   // Compute and report edge + node diff whenever edges or nodes change
   useEffect(() => {
     if (!onEdgeDiffChange || !effectiveModule) return;
     const baseline = baselineEdgesRef.current;
-    const edgeKey = (e: Edge) => `${e.source}:${e.sourceHandle || ''}->${e.target}:${e.targetHandle || ''}`;
-    const baseSet = new Set(baseline.map(edgeKey));
-    const currSet = new Set(edges.map(edgeKey));
+    const baseSet = new Set(baseline.map(schematicEdgeKey));
+    const currSet = new Set(edges.map(schematicEdgeKey));
 
     const added: SchematicEdgeInfo[] = [];
     const removed: SchematicEdgeInfo[] = [];
 
     for (const e of edges) {
-      if (!baseSet.has(edgeKey(e))) {
+      if (!baseSet.has(schematicEdgeKey(e))) {
         added.push({ source: e.source, sourceHandle: e.sourceHandle || undefined, target: e.target, targetHandle: e.targetHandle || undefined, label: typeof e.label === 'string' ? e.label : undefined });
       }
     }
     for (const e of baseline) {
-      if (!currSet.has(edgeKey(e))) {
+      if (!currSet.has(schematicEdgeKey(e))) {
         removed.push({ source: e.source, sourceHandle: e.sourceHandle || undefined, target: e.target, targetHandle: e.targetHandle || undefined, label: typeof e.label === 'string' ? e.label : undefined });
       }
     }
@@ -1105,12 +1133,12 @@ function SchematicViewerInner({
     const baseEdgeLabelMap = new Map<string, string>();
     for (const e of baseline) {
       const lbl = typeof e.label === 'string' ? e.label : '';
-      if (lbl) baseEdgeLabelMap.set(edgeKey(e), lbl);
+      if (lbl) baseEdgeLabelMap.set(schematicEdgeKey(e), lbl);
     }
     const renamedSignals: RenamedSignal[] = [];
     const seenRenames = new Set<string>();
     for (const e of edges) {
-      const key = edgeKey(e);
+      const key = schematicEdgeKey(e);
       const baseLabel = baseEdgeLabelMap.get(key);
       const currLabel = typeof e.label === 'string' ? e.label : '';
       if (baseLabel && currLabel && baseLabel !== currLabel && !seenRenames.has(baseLabel)) {
@@ -1157,8 +1185,10 @@ function SchematicViewerInner({
     const baseNodeMap = new Map(baselineNodes.map(n => [n.id, n]));
     const renamedGates: RenamedGate[] = [];
     for (const n of nodes) {
-      if (n.type === 'gate' && baseNodeMap.has(n.id)) {
-        const baseNode = baseNodeMap.get(n.id)!;
+      if (!baseNodeMap.has(n.id)) continue;
+      const baseNode = baseNodeMap.get(n.id)!;
+
+      if (n.type === 'gate') {
         const baseData = baseNode.data as GateNodeData;
         const currData = n.data as GateNodeData;
         if (currData.label !== baseData.label) {
@@ -1169,10 +1199,21 @@ function SchematicViewerInner({
             newInstanceName: currData.label,
           });
         }
+      } else if (n.type === 'port') {
+        const baseData = baseNode.data as PortNodeData;
+        const currData = n.data as PortNodeData;
+        if (currData.label !== baseData.label && !seenRenames.has(baseData.label)) {
+          renamedSignals.push({ oldName: baseData.label, newName: currData.label });
+          seenRenames.add(baseData.label);
+        }
       }
     }
 
-    onEdgeDiffChange({ added, removed, addedNodes, deletedNodes, renamedSignals, renamedGates }, effectiveModule);
+    const nextDiff = { added, removed, addedNodes, deletedNodes, renamedSignals, renamedGates };
+    const diffSignature = JSON.stringify({ module: effectiveModule, diff: nextDiff });
+    if (lastReportedDiffRef.current === diffSignature) return;
+    lastReportedDiffRef.current = diffSignature;
+    onEdgeDiffChange(nextDiff, effectiveModule);
   }, [edges, nodes, onEdgeDiffChange, effectiveModule]);
 
   const handleNodeClick = useCallback((_: React.MouseEvent, _node: Node) => {
@@ -1226,9 +1267,15 @@ function SchematicViewerInner({
   // Apply edge rename
   const handleRenameEdgeConfirm = useCallback(() => {
     if (!renameEdge) return;
-    setEdges(eds => eds.map(e =>
-      e.id === renameEdge.id ? { ...e, label: renameValue || undefined } : e
-    ));
+    const currentLabel = typeof renameEdge.label === 'string' ? renameEdge.label : '';
+    const nextLabel = renameValue.trim();
+    setEdges(eds => eds.map((e) => {
+      const edgeLabel = typeof e.label === 'string' ? e.label : '';
+      if (currentLabel) {
+        return edgeLabel === currentLabel ? { ...e, label: nextLabel || undefined } : e;
+      }
+      return e.id === renameEdge.id ? { ...e, label: nextLabel || undefined } : e;
+    }));
     setRenameEdge(null);
     setRenameValue('');
   }, [renameEdge, renameValue, setEdges]);
@@ -1241,25 +1288,35 @@ function SchematicViewerInner({
   }, [contextMenuEdge, setEdges]);
 
   // Open rename dialog for a gate
-  const handleRenameGateOpen = useCallback(() => {
-    if (!contextMenuNode || contextMenuNode.type !== 'gate') return;
-    const data = contextMenuNode.data as GateNodeData;
+  const handleRenameNodeOpen = useCallback(() => {
+    if (!contextMenuNode || (contextMenuNode.type !== 'gate' && contextMenuNode.type !== 'port')) return;
+    const data = contextMenuNode.data as GateNodeData | PortNodeData;
     setRenameValue(data.label);
-    setRenameGateNode(contextMenuNode);
+    setRenameNode(contextMenuNode);
     setContextMenuNode(null);
   }, [contextMenuNode]);
 
-  // Apply gate rename
-  const handleRenameGateConfirm = useCallback(() => {
-    if (!renameGateNode || !renameValue.trim()) return;
+  // Apply node rename
+  const handleRenameNodeConfirm = useCallback(() => {
+    if (!renameNode || !renameValue.trim()) return;
+    const nextLabel = renameValue.trim();
+    const currentLabel = ((renameNode.data as GateNodeData | PortNodeData).label || '').trim();
+
     setNodes(nds => nds.map(n =>
-      n.id === renameGateNode.id
-        ? { ...n, data: { ...n.data, label: renameValue.trim() } }
+      n.id === renameNode.id
+        ? { ...n, data: { ...n.data, label: nextLabel } }
         : n
     ));
-    setRenameGateNode(null);
+
+    if (renameNode.type === 'port' && currentLabel && currentLabel !== nextLabel) {
+      setEdges(eds => eds.map(e =>
+        e.label === currentLabel ? { ...e, label: nextLabel } : e
+      ));
+    }
+
+    setRenameNode(null);
     setRenameValue('');
-  }, [renameGateNode, renameValue, setNodes]);
+  }, [renameNode, renameValue, setNodes, setEdges]);
 
   const handleZoomIn = useCallback(() => { reactFlowInstance.zoomIn({ duration: 200 }); }, [reactFlowInstance]);
   const handleZoomOut = useCallback(() => { reactFlowInstance.zoomOut({ duration: 200 }); }, [reactFlowInstance]);
@@ -1296,7 +1353,7 @@ function SchematicViewerInner({
         svg = svg.replace(
           /<svg([^>]*)>/,
           (_, attrs) => {
-            let cleaned = attrs.replace(/\bwidth="[^"]*"/, '').replace(/\bheight="[^"]*"/, '');
+            const cleaned = attrs.replace(/\bwidth="[^"]*"/, '').replace(/\bheight="[^"]*"/, '');
             return `<svg${cleaned} viewBox="0 0 ${pw} ${ph}" style="width:${pw}px;height:${ph}px">`;
           }
         );
@@ -1623,6 +1680,7 @@ function SchematicViewerInner({
                   onClick={() => {
                     setCurrentModule(m.name);
                     setModuleStack([]);
+                    onNavigateToModule?.(m.name);
                   }}
                   className="font-mono text-xs"
                 >
@@ -1752,7 +1810,7 @@ function SchematicViewerInner({
                   </Tooltip>
                   <div className="h-px bg-border mx-0.5" />
                   <Tooltip>
-                    <TooltipTrigger render={<button onClick={handleToggleFluid} className={`flex items-center justify-center h-7 w-7 rounded hover:bg-accent transition-colors ${fluidEdges ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}`} />}>
+                    <TooltipTrigger render={<button onClick={handleToggleFluid} className="flex items-center justify-center h-7 w-7 rounded hover:bg-accent transition-colors text-muted-foreground hover:text-foreground" />}>
                       <Spline className="h-3.5 w-3.5" />
                     </TooltipTrigger>
                     <TooltipContent side="right">{fluidEdges ? 'Orthogonal Edges' : 'Fluid Curves'}</TooltipContent>
@@ -1839,9 +1897,9 @@ function SchematicViewerInner({
                   <ContextMenuSeparator />
                 </>
               )}
-              {contextMenuNode.type === 'gate' && (
+              {(contextMenuNode.type === 'gate' || contextMenuNode.type === 'port') && (
                 <>
-                  <ContextMenuItem onClick={handleRenameGateOpen}>
+                  <ContextMenuItem onClick={handleRenameNodeOpen}>
                     <Pencil className="h-4 w-4" />
                     <span>Rename</span>
                   </ContextMenuItem>
@@ -1922,23 +1980,32 @@ function SchematicViewerInner({
 
       {/* Rename dialog (shared for connections and gates) */}
       <Dialog
-        open={!!renameEdge || !!renameGateNode}
-        onOpenChange={(open) => { if (!open) { setRenameEdge(null); setRenameGateNode(null); setRenameValue(''); } }}
+        open={!!renameEdge || !!renameNode}
+        onOpenChange={(open) => { if (!open) { setRenameEdge(null); setRenameNode(null); setRenameValue(''); } }}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{renameEdge ? 'Rename Connection' : 'Rename Gate'}</DialogTitle>
+            <DialogTitle>
+              {renameEdge ? 'Rename Connection' : renameNode?.type === 'port' ? 'Rename Port' : 'Rename Gate'}
+            </DialogTitle>
           </DialogHeader>
-          <form onSubmit={(e) => { e.preventDefault(); renameEdge ? handleRenameEdgeConfirm() : handleRenameGateConfirm(); }}>
+          <form onSubmit={(e) => {
+            e.preventDefault();
+            if (renameEdge) {
+              handleRenameEdgeConfirm();
+            } else {
+              handleRenameNodeConfirm();
+            }
+          }}>
             <Input
               value={renameValue}
               onChange={(e) => setRenameValue(e.target.value)}
-              placeholder={renameEdge ? 'Connection name' : 'Instance name'}
+              placeholder={renameEdge ? 'Connection name' : renameNode?.type === 'port' ? 'Port name' : 'Instance name'}
               autoFocus
               className="font-mono text-sm"
             />
             <DialogFooter className="mt-4">
-              <Button type="button" variant="outline" onClick={() => { setRenameEdge(null); setRenameGateNode(null); setRenameValue(''); }}>
+              <Button type="button" variant="outline" onClick={() => { setRenameEdge(null); setRenameNode(null); setRenameValue(''); }}>
                 Cancel
               </Button>
               <Button type="submit">Rename</Button>
