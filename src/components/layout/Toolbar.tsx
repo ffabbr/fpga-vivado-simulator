@@ -2,7 +2,7 @@
 
 import {
   Play, Square, Download, Upload, Cpu, FilePlus2,
-  FileCode2, Zap, LayoutGrid, Waves,
+  FileCode2, Zap, LayoutGrid, Waves, CircuitBoard,
   Undo2, Redo2, Scissors, Copy, ClipboardPaste, Search,
   FolderPlus, BookOpen, FolderArchive,
 } from 'lucide-react';
@@ -21,11 +21,11 @@ interface ToolbarProps {
   projectName: string;
   isSimulating: boolean;
   isSynthesizing?: boolean;
-  activeView: 'editor' | 'board' | 'waveform';
+  activeView: 'editor' | 'board' | 'waveform' | 'schematic';
   onRunSimulation: () => void;
   onStopSimulation: () => void;
   onSynthesize: () => void;
-  onSetView: (view: 'editor' | 'board' | 'waveform') => void;
+  onSetView: (view: 'editor' | 'board' | 'waveform' | 'schematic') => void;
   onExportProject: () => void;
   onExportZip: () => void;
   onImportProject: () => void;
@@ -218,6 +218,9 @@ export default function Toolbar({
                 <Play className="h-4 w-4 mr-2" /> Run Test
               </MenubarItem>
               <MenubarSeparator />
+              <MenubarItem onClick={() => onSetView('schematic')}>
+                <CircuitBoard className="h-4 w-4 mr-2" /> Open Schematic View
+              </MenubarItem>
               <MenubarItem onClick={() => onSetView('board')}>
                 <LayoutGrid className="h-4 w-4 mr-2" /> Open Board View
               </MenubarItem>
@@ -233,7 +236,7 @@ export default function Toolbar({
           <ToggleGroup
             value={[activeView]}
             onValueChange={(newValue) => {
-              if (newValue.length > 0) onSetView(newValue[newValue.length - 1] as 'editor' | 'board' | 'waveform');
+              if (newValue.length > 0) onSetView(newValue[newValue.length - 1] as 'editor' | 'board' | 'waveform' | 'schematic');
             }}
             size="sm"
             className="border border-border p-0 data-[size=sm]:!rounded-[11px]"
@@ -273,6 +276,24 @@ export default function Toolbar({
                 <span className="text-[11px]">Wave</span>
               </TooltipTrigger>
               <TooltipContent>Waveform Viewer</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <ToggleGroupItem
+                    value="schematic"
+                    className={`h-6 px-2 gap-1.5 text-muted-foreground hover:text-foreground ${
+                      activeView === 'schematic'
+                        ? 'data-[state=on]:!bg-black data-[state=on]:!text-white aria-pressed:!bg-black aria-pressed:!text-white dark:data-[state=on]:!bg-white dark:data-[state=on]:!text-black dark:aria-pressed:!bg-white dark:aria-pressed:!text-black shadow-sm'
+                        : ''
+                    }`}
+                  />
+                }
+              >
+                <CircuitBoard className="h-3.5 w-3.5" />
+                <span className="text-[11px]">Schematic</span>
+              </TooltipTrigger>
+              <TooltipContent>Circuit Schematic</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger

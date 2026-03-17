@@ -19,8 +19,11 @@ import FileExplorer from '@/components/project/FileExplorer';
 import WelcomeDialog from '@/components/layout/WelcomeDialog';
 import ConsolePanel from '@/components/console/ConsolePanel';
 import { Button } from '@/components/ui/button';
-import { Trash2 } from 'lucide-react';
+import { Trash2, Check, X } from 'lucide-react';
 import WaveformViewer from '@/components/waveform/WaveformViewer';
+import SchematicViewer, { type SchematicEdgeDiff } from '@/components/schematic/SchematicViewer';
+import { computeProposedSource, computeLineDiff, type DiffLine } from '@/lib/verilog-codegen';
+import CodeReviewPanel from '@/components/schematic/CodeReviewPanel';
 import {
   ResizableHandle, ResizablePanel, ResizablePanelGroup,
 } from '@/components/ui/resizable';
@@ -64,25 +67,39 @@ export default function Home() {
     return createEmptyProject();
   });
 
-  const [activeView, setActiveView] = useState<'editor' | 'board' | 'waveform'>('editor');
+  const [activeView, setActiveView] = useState<'editor' | 'board' | 'waveform' | 'schematic'>('editor');
   const [isSimulating, setIsSimulating] = useState(false);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
   const [simulationResult, setSimulationResult] = useState<SimulationResult | null>(null);
   const [netlist, setNetlist] = useState<YosysNetlist | null>(null);
-  const [bottomTab, setBottomTab] = useState<'console' | 'waveform'>('console');
+  const [bottomTab, setBottomTab] = useState<'console' | 'waveform' | 'codeReview'>('console');
+  const [schematicRequestedModule, setSchematicRequestedModule] = useState<string | null>(null);
+  const [schematicResetKey, setSchematicResetKey] = useState(0);
+  const [pendingSchematicEdits, setPendingSchematicEdits] = useState<{
+    diff: DiffLine[];
+    targetFileId: string;
+    targetFileName: string;
+    newSource: string;
+    changeCount: number;
+  } | null>(null);
   const [newFileDialogOpen, setNewFileDialogOpen] = useState(false);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const yosysClientRef = useRef<YosysClient | null>(null);
 
-  // Load from localStorage on mount
+  // Load from localStorage on mount + detect mobile by viewport width
   useEffect(() => {
     const saved = loadProject();
     if (saved) {
       dispatch({ type: 'LOAD_PROJECT', state: saved });
     }
+    const checkMobile = () => setIsMobile(window.innerWidth < 768);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
     setLoaded(true);
+    return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
   // Save on change
@@ -112,6 +129,13 @@ export default function Home() {
   }, [verilogContentKey, state.topModule]);
 
   const activeFile = state.files.find(f => f.id === state.activeFileId) || null;
+
+  // Parsed Verilog results for the schematic viewer
+  const schematicParseResults = useMemo(() => {
+    return state.files
+      .filter(f => f.type === 'verilog')
+      .map(f => parseVerilog(f.content));
+  }, [state.files]);
 
   const addConsoleMsg = useCallback((type: ConsoleMessage['type'], message: string, source?: string) => {
     dispatch({
@@ -223,6 +247,21 @@ export default function Home() {
       setIsSynthesizing(false);
     }
   }, [state.files, state.topModule, addConsoleMsg]);
+
+  // Auto-switch to Code Review tab and show active file's module when entering schematic view
+  useEffect(() => {
+    if (activeView === 'schematic') {
+      setBottomTab('codeReview');
+      // Show the module from the file the user was viewing
+      const file = state.files.find(f => f.id === state.activeFileId);
+      if (file && (file.type === 'verilog' || file.type === 'testbench')) {
+        const parsed = parseVerilog(file.content);
+        if (parsed.modules.length > 0) {
+          setSchematicRequestedModule(parsed.modules[0].name);
+        }
+      }
+    }
+  }, [activeView]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-synthesize when entering board view without a netlist
   useEffect(() => {
@@ -386,6 +425,60 @@ export default function Home() {
     addConsoleMsg('info', 'Example project loaded', 'System');
   }, [addConsoleMsg]);
 
+  // Schematic edge diff → code review
+  const handleSchematicEdgeDiff = useCallback((diff: SchematicEdgeDiff, moduleName: string) => {
+    if (diff.added.length === 0 && diff.removed.length === 0 && (!diff.addedNodes || diff.addedNodes.length === 0) && (!diff.deletedNodes || diff.deletedNodes.length === 0) && (!diff.renamedSignals || diff.renamedSignals.length === 0) && (!diff.renamedGates || diff.renamedGates.length === 0)) {
+      setPendingSchematicEdits(null);
+      return;
+    }
+
+    // Find the file containing this module
+    const verilogFiles = state.files.filter(f => f.type === 'verilog');
+    let targetFile: ProjectFile | null = null;
+    for (const f of verilogFiles) {
+      const pr = parseVerilog(f.content);
+      if (pr.modules.some(m => m.name === moduleName)) {
+        targetFile = f;
+        break;
+      }
+    }
+    if (!targetFile) return;
+
+    // Get the target module and all modules
+    const allModules = schematicParseResults.flatMap(pr => pr.modules);
+    const targetModule = allModules.find(m => m.name === moduleName);
+    if (!targetModule) return;
+
+    const newSource = computeProposedSource(targetFile.content, diff, targetModule, allModules);
+    if (newSource === targetFile.content) {
+      setPendingSchematicEdits(null);
+      return;
+    }
+
+    const lineDiff = computeLineDiff(targetFile.content, newSource);
+    const changeCount = lineDiff.filter(d => d.type !== 'unchanged').length;
+
+    setPendingSchematicEdits({
+      diff: lineDiff,
+      targetFileId: targetFile.id,
+      targetFileName: targetFile.name,
+      newSource,
+      changeCount,
+    });
+  }, [state.files, schematicParseResults]);
+
+  const handleAcceptSchematicEdits = useCallback(() => {
+    if (!pendingSchematicEdits) return;
+    dispatch({ type: 'UPDATE_FILE', id: pendingSchematicEdits.targetFileId, content: pendingSchematicEdits.newSource });
+    setPendingSchematicEdits(null);
+    addConsoleMsg('success', `Schematic edits applied to ${pendingSchematicEdits.targetFileName}`, 'Schematic');
+  }, [pendingSchematicEdits, addConsoleMsg]);
+
+  const handleRejectSchematicEdits = useCallback(() => {
+    setPendingSchematicEdits(null);
+    setSchematicResetKey(k => k + 1);
+  }, []);
+
   const getEditorLanguage = (file: ProjectFile | null) => {
     if (!file) return 'verilog';
     if (file.name.endsWith('.xdc')) return 'xdc';
@@ -393,26 +486,12 @@ export default function Home() {
   };
 
   if (!loaded) {
-    return (
-      <>
-        <div className="md:hidden fixed inset-0 z-50 bg-background flex items-center justify-center p-6 text-center">
-          <div className="max-w-sm space-y-3">
-            <p className="text-lg font-semibold text-foreground">Mobile Not Supported Yet</p>
-            <p className="text-sm text-muted-foreground">
-              FPGA Studio currently supports desktop widths only. Please open this app on a larger screen.
-            </p>
-          </div>
-        </div>
-        <div className="hidden md:flex h-screen bg-background items-center justify-center text-muted-foreground">
-          Loading FPGA Studio...
-        </div>
-      </>
-    );
+    return null;
   }
 
-  return (
-    <>
-      <div className="md:hidden fixed inset-0 z-50 bg-background flex items-center justify-center p-6 text-center">
+  if (isMobile) {
+    return (
+      <div className="fixed inset-0 z-50 bg-background flex items-center justify-center p-6 text-center">
         <div className="max-w-sm space-y-3">
           <p className="text-lg font-semibold text-foreground">Mobile Not Supported Yet</p>
           <p className="text-sm text-muted-foreground">
@@ -420,8 +499,12 @@ export default function Home() {
           </p>
         </div>
       </div>
+    );
+  }
 
-      <div className="hidden md:flex h-screen flex-col bg-background text-foreground overflow-hidden">
+  return (
+    <>
+      <div className="flex h-screen flex-col bg-background text-foreground overflow-hidden">
       <input
         ref={fileInputRef}
         type="file"
@@ -443,7 +526,7 @@ export default function Home() {
         isSynthesizing={isSynthesizing}
         onOpenFile={(id) => {
           dispatch({ type: 'OPEN_FILE', id });
-          if (activeView === 'board') setActiveView('editor');
+          if (activeView !== 'editor') setActiveView('editor');
         }}
         onSetView={setActiveView}
         onSynthesize={handleSynthesize}
@@ -492,7 +575,15 @@ export default function Home() {
               onCreateDialogOpenChange={setNewFileDialogOpen}
               onOpenFile={(id) => {
                 dispatch({ type: 'OPEN_FILE', id });
-                if (activeView === 'board') {
+                if (activeView === 'schematic') {
+                  const file = state.files.find(f => f.id === id);
+                  if (file && (file.type === 'verilog' || file.type === 'testbench')) {
+                    const parsed = parseVerilog(file.content);
+                    if (parsed.modules.length > 0) {
+                      setSchematicRequestedModule(parsed.modules[0].name);
+                    }
+                  }
+                } else if (activeView !== 'editor') {
                   setActiveView('editor');
                 }
               }}
@@ -584,6 +675,18 @@ export default function Home() {
                 {activeView === 'waveform' && (
                   <WaveformViewer simulation={simulationResult} />
                 )}
+
+                {activeView === 'schematic' && (
+                  <SchematicViewer
+                    parseResults={schematicParseResults}
+                    topModuleName={state.topModule || detectLikelyTopModule(state.files.filter(f => f.type === 'verilog'))}
+                    contentKey={verilogContentKey}
+                    requestedModuleName={schematicRequestedModule}
+                    resetKey={schematicResetKey}
+                    onEdgeDiffChange={handleSchematicEdgeDiff}
+                    onConsoleMessage={addConsoleMsg}
+                  />
+                )}
               </ResizablePanel>
 
               <ResizableHandle withHandle direction="vertical" />
@@ -605,6 +708,9 @@ export default function Home() {
                             </span>
                           )}
                         </TabsTrigger>
+                        <TabsTrigger value="codeReview" className="text-xs h-6 data-[state=active]:bg-secondary">
+                          Code Review
+                        </TabsTrigger>
                       </TabsList>
                       {bottomTab === 'console' && (
                         <>
@@ -620,11 +726,28 @@ export default function Home() {
                           )}
                         </>
                       )}
+                      {bottomTab === 'codeReview' && pendingSchematicEdits && (
+                        <span className="text-[10px] text-muted-foreground">
+                          {pendingSchematicEdits.changeCount} {pendingSchematicEdits.changeCount === 1 ? 'change' : 'changes'}
+                        </span>
+                      )}
                     </div>
                     {bottomTab === 'console' && (
                       <Button variant="ghost" size="sm" className="h-6 w-6 p-0" onClick={() => dispatch({ type: 'CLEAR_CONSOLE' })}>
                         <Trash2 className="h-3.5 w-3.5" />
                       </Button>
+                    )}
+                    {bottomTab === 'codeReview' && pendingSchematicEdits && (
+                      <div className="flex items-center gap-1">
+                        <Button variant="ghost" size="sm" className="h-6 px-2 gap-1 text-xs text-muted-foreground hover:text-foreground" onClick={handleRejectSchematicEdits}>
+                          <X className="h-3 w-3" />
+                          Decline
+                        </Button>
+                        <Button variant="ghost" size="sm" className="h-6 px-2 gap-1 text-xs text-green-500 hover:text-green-600 hover:bg-green-500/10" onClick={handleAcceptSchematicEdits}>
+                          <Check className="h-3 w-3" />
+                          Accept
+                        </Button>
+                      </div>
                     )}
                   </div>
                   <TabsContent value="console" className="flex-1 mt-0 overflow-hidden">
@@ -634,6 +757,15 @@ export default function Home() {
                   </TabsContent>
                   <TabsContent value="waveform" className="flex-1 mt-0 overflow-hidden">
                     <WaveformViewer simulation={simulationResult} />
+                  </TabsContent>
+                  <TabsContent value="codeReview" className="flex-1 mt-0 overflow-hidden">
+                    {activeView === 'schematic' ? (
+                      <CodeReviewPanel diff={pendingSchematicEdits?.diff ?? null} />
+                    ) : (
+                      <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                        <p className="text-xs">Enter Schematic view to use Code Review.</p>
+                      </div>
+                    )}
                   </TabsContent>
                 </Tabs>
               </ResizablePanel>

@@ -15,7 +15,7 @@ import {
   FileCode2, TestTube2, Settings2, FileText,
   Zap, Play, Square, Sun, Moon,
   Download, Upload, FilePlus2, Cpu,
-  FileCode, Waves, LayoutGrid, Trash2, BookOpen, FolderPlus, Highlighter, MessageSquareOff, FolderArchive,
+  FileCode, Waves, LayoutGrid, CircuitBoard, Trash2, BookOpen, FolderPlus, Highlighter, MessageSquareOff, FolderArchive,
 } from 'lucide-react';
 import type { ProjectFile } from '@/lib/store';
 
@@ -23,11 +23,11 @@ interface CommandMenuProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   files: ProjectFile[];
-  activeView: 'editor' | 'board' | 'waveform';
+  activeView: 'editor' | 'board' | 'waveform' | 'schematic';
   isSimulating: boolean;
   isSynthesizing: boolean;
   onOpenFile: (id: string) => void;
-  onSetView: (view: 'editor' | 'board' | 'waveform') => void;
+  onSetView: (view: 'editor' | 'board' | 'waveform' | 'schematic') => void;
   onSynthesize: () => void;
   onRunSimulation: () => void;
   onStopSimulation: () => void;
@@ -199,6 +199,13 @@ export default function CommandMenu({
             <Waves className="h-4 w-4" />
             <span>Waveform Viewer</span>
             {activeView === 'waveform' && <CommandShortcut>Active</CommandShortcut>}
+          </CommandItem>
+          <CommandItem
+            onSelect={() => runAndClose(() => onSetView('schematic'))}
+          >
+            <CircuitBoard className="h-4 w-4" />
+            <span>Schematic View</span>
+            {activeView === 'schematic' && <CommandShortcut>Active</CommandShortcut>}
           </CommandItem>
           <CommandItem
             onSelect={() => runAndClose(() => onSetView('board'))}

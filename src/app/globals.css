@@ -152,4 +152,29 @@
   .toaster [data-sonner-toast] [data-description] {
     color: var(--muted-foreground) !important;
   }
+
+  /* React Flow dark mode overrides */
+  .dark .react-flow__edge-path {
+    stroke: oklch(0.6 0 0);
+  }
+  .dark .react-flow__edge-text {
+    fill: oklch(0.6 0 0);
+  }
+  .react-flow__edge-path {
+    stroke: oklch(0.5 0 0);
+  }
+  .react-flow__edge.selected .react-flow__edge-path {
+    stroke: oklch(0.6 0.15 250);
+  }
+
+  /* MiniMap viewport indicator rounded corners */
+  .react-flow__minimap-mask {
+    rx: 3;
+    ry: 3;
+  }
+  .dark .react-flow__minimap {
+    --xy-minimap-mask-background-color-props: rgba(255,255,255,0.06);
+    --xy-minimap-mask-stroke-color-props: rgba(255,255,255,0.15);
+    --xy-minimap-mask-stroke-width-props: 1;
+  }
 }

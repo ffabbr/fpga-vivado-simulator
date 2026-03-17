@@ -87,6 +87,33 @@ function stripComments(src: string): string {
   return result;
 }
 
+// Find the balanced begin/end block starting at the given index (pointing to 'begin')
+// Returns the substring from 'begin' to its matching 'end', or null if unbalanced
+function extractBalancedBlock(src: string, startIdx: number): string | null {
+  let depth = 0;
+  let i = startIdx;
+  while (i < src.length) {
+    const rest = src.slice(i);
+    const beginMatch = rest.match(/^\bbegin\b/);
+    if (beginMatch) {
+      depth++;
+      i += 5; // length of 'begin'
+      continue;
+    }
+    const endMatch = rest.match(/^\bend\b/);
+    if (endMatch) {
+      depth--;
+      if (depth === 0) {
+        return src.slice(startIdx, i + 3); // include 'end'
+      }
+      i += 3; // length of 'end'
+      continue;
+    }
+    i++;
+  }
+  return null;
+}
+
 function parseWidth(widthStr: string): { width: number; msb: number; lsb: number } {
   const match = widthStr.match(/\[(\d+):(\d+)\]/);
   if (match) {
@@ -162,6 +189,14 @@ function parseRegs(body: string): VerilogReg[] {
       regs.push({ name, width, msb, lsb });
     }
   }
+  // Parse integer declarations as 32-bit regs
+  const intRegex = /\binteger\s+(\w+(?:\s*,\s*\w+)*)\s*;/g;
+  while ((match = intRegex.exec(body)) !== null) {
+    const names = match[1].split(',').map(n => n.trim());
+    for (const name of names) {
+      regs.push({ name, width: 32, msb: 31, lsb: 0 });
+    }
+  }
   return regs;
 }
 
@@ -192,24 +227,54 @@ function parseAssigns(body: string): VerilogAssign[] {
 
 function parseAlwaysBlocks(body: string): VerilogAlwaysBlock[] {
   const blocks: VerilogAlwaysBlock[] = [];
-  const regex = /\balways\s*@\s*\(([^)]*)\)\s*(begin[\s\S]*?end|[^;]*;)/g;
+  const headerRegex = /\balways\s*@\s*\(([^)]*)\)\s*/g;
   let match;
-  while ((match = regex.exec(body)) !== null) {
+  while ((match = headerRegex.exec(body)) !== null) {
     const sensitivity = match[1].trim();
-    const blockBody = match[2].trim();
+    const afterHeader = match.index + match[0].length;
+    let blockBody: string;
+    if (body.slice(afterHeader).match(/^\s*begin\b/)) {
+      const beginIdx = body.indexOf('begin', afterHeader);
+      const extracted = extractBalancedBlock(body, beginIdx);
+      if (extracted) {
+        blockBody = extracted;
+        headerRegex.lastIndex = beginIdx + extracted.length;
+      } else {
+        continue;
+      }
+    } else {
+      const semi = body.indexOf(';', afterHeader);
+      if (semi === -1) continue;
+      blockBody = body.slice(afterHeader, semi + 1);
+      headerRegex.lastIndex = semi + 1;
+    }
     const type = sensitivity.includes('posedge') || sensitivity.includes('negedge')
       ? 'sequential' : 'combinational';
-    blocks.push({ sensitivity, body: blockBody, type });
+    blocks.push({ sensitivity, body: blockBody.trim(), type });
   }
   return blocks;
 }
 
 function parseInitialBlocks(body: string): VerilogInitialBlock[] {
   const blocks: VerilogInitialBlock[] = [];
-  const regex = /\binitial\s+(begin[\s\S]*?end)/g;
+  const headerRegex = /\binitial\s+/g;
   let match;
-  while ((match = regex.exec(body)) !== null) {
-    blocks.push({ body: match[1].trim() });
+  while ((match = headerRegex.exec(body)) !== null) {
+    const afterHeader = match.index + match[0].length;
+    if (body.slice(afterHeader).match(/^\s*begin\b/)) {
+      const beginIdx = body.indexOf('begin', afterHeader);
+      const extracted = extractBalancedBlock(body, beginIdx);
+      if (extracted) {
+        blocks.push({ body: extracted.trim() });
+        headerRegex.lastIndex = beginIdx + extracted.length;
+      }
+    } else {
+      const semi = body.indexOf(';', afterHeader);
+      if (semi !== -1) {
+        blocks.push({ body: body.slice(afterHeader, semi + 1).trim() });
+        headerRegex.lastIndex = semi + 1;
+      }
+    }
   }
   return blocks;
 }
@@ -232,7 +297,7 @@ function parseGatePrimitives(body: string): VerilogGatePrimitive[] {
   const primitives: VerilogGatePrimitive[] = [];
   // Match: gate_type [instance_name] ( output, input1, input2, ... );
   // The instance name is optional. Args are comma-separated identifiers.
-  const regex = /\b(and|or|xor|not|nand|nor|xnor|buf)\s+(?:(\w+)\s*)?\(\s*([^)]+)\)\s*;/g;
+  const regex = /\b(and|or|xor|not|nand|nor|xnor|buf)\s*(?:(\w+)\s*)?\(\s*([^)]+)\)\s*;/g;
   let match;
   while ((match = regex.exec(body)) !== null) {
     const gate = match[1];
@@ -291,12 +356,12 @@ export function parseVerilog(source: string): ParseResult {
   const modules: VerilogModule[] = [];
   const cleaned = stripComments(source);
 
-  const moduleRegex = /\bmodule\s+(\w+)\s*(?:#\s*\([^)]*\))?\s*\(([^)]*)\)\s*;([\s\S]*?)\bendmodule\b/g;
+  const moduleRegex = /\bmodule\s+(\w+)\s*(?:#\s*\([^)]*\))?\s*(?:\(([^)]*)\))?\s*;([\s\S]*?)\bendmodule\b/g;
   let match;
 
   while ((match = moduleRegex.exec(cleaned)) !== null) {
     const name = match[1];
-    const portSection = match[2];
+    const portSection = match[2] || '';
     const body = match[3];
 
     try {

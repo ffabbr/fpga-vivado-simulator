@@ -63,6 +63,48 @@ class SimulationContext {
   }
 }
 
+// Find the balanced begin/end block in a string starting at startIdx (pointing to 'begin').
+// Returns the end index (after 'end'), or -1 if unbalanced.
+function findBalancedEnd(src: string, startIdx: number): number {
+  let depth = 0;
+  let i = startIdx;
+  while (i < src.length) {
+    const rest = src.slice(i);
+    if (rest.match(/^\bbegin\b/)) {
+      depth++;
+      i += 5;
+      continue;
+    }
+    if (rest.match(/^\bend\b/)) {
+      depth--;
+      if (depth === 0) return i + 3;
+      i += 3;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Extract the body portion (begin...end block or single statement) from a string.
+// Returns [body, restOfString].
+function extractBody(src: string): [string, string] {
+  const trimmed = src.trimStart();
+  if (trimmed.match(/^\bbegin\b/)) {
+    const offset = src.length - trimmed.length;
+    const endIdx = findBalancedEnd(src, offset);
+    if (endIdx !== -1) {
+      return [src.slice(offset, endIdx), src.slice(endIdx)];
+    }
+  }
+  // Single statement ending with ;
+  const semi = src.indexOf(';');
+  if (semi !== -1) {
+    return [src.slice(0, semi + 1).trim(), src.slice(semi + 1)];
+  }
+  return [src.trim(), ''];
+}
+
 // Expression evaluator for Verilog expressions
 function evaluateExpression(expr: string, ctx: SimulationContext): number {
   expr = expr.trim();
@@ -408,13 +450,18 @@ function executeStatement(stmt: string, ctx: SimulationContext): void {
   }
 
   // if-else
-  const ifMatch = stmt.match(/^if\s*\((.+?)\)\s*(begin[\s\S]*?end|[^;]*;)(?:\s*else\s*(begin[\s\S]*?end|if[\s\S]*|[^;]*;))?/);
-  if (ifMatch) {
-    const cond = evaluateExpression(ifMatch[1], ctx);
+  const ifHeaderMatch = stmt.match(/^if\s*\((.+?)\)\s*/);
+  if (ifHeaderMatch) {
+    const cond = evaluateExpression(ifHeaderMatch[1], ctx);
+    const afterCond = stmt.slice(ifHeaderMatch[0].length);
+    const [ifBody, afterIfBody] = extractBody(afterCond);
+    const elseMatch = afterIfBody.match(/^\s*else\s*/);
     if (cond) {
-      executeBlock(ifMatch[2], ctx);
-    } else if (ifMatch[3]) {
-      executeBlock(ifMatch[3], ctx);
+      executeBlock(ifBody, ctx);
+    } else if (elseMatch) {
+      const afterElse = afterIfBody.slice(elseMatch[0].length);
+      const [elseBody] = extractBody(afterElse);
+      executeBlock(elseBody, ctx);
     }
     return;
   }
@@ -457,12 +504,14 @@ function executeStatement(stmt: string, ctx: SimulationContext): void {
   }
 
   // for loop
-  const forMatch = stmt.match(/^for\s*\((.+?);(.+?);(.+?)\)\s*(begin[\s\S]*?end|[^;]*;)/);
+  const forMatch = stmt.match(/^for\s*\((.+?);(.+?);(.+?)\)\s*/);
   if (forMatch) {
+    const afterForHeader = stmt.slice(forMatch[0].length);
+    const [forBody] = extractBody(afterForHeader);
     executeStatement(forMatch[1].trim() + ';', ctx);
     let iterations = 0;
     while (evaluateExpression(forMatch[2].trim(), ctx) && iterations < 10000) {
-      executeBlock(forMatch[4], ctx);
+      executeBlock(forBody, ctx);
       executeStatement(forMatch[3].trim() + ';', ctx);
       iterations++;
     }
@@ -470,11 +519,13 @@ function executeStatement(stmt: string, ctx: SimulationContext): void {
   }
 
   // repeat
-  const repeatMatch = stmt.match(/^repeat\s*\((.+?)\)\s*(begin[\s\S]*?end|[^;]*;)/);
+  const repeatMatch = stmt.match(/^repeat\s*\((.+?)\)\s*/);
   if (repeatMatch) {
+    const afterRepeat = stmt.slice(repeatMatch[0].length);
+    const [repeatBody] = extractBody(afterRepeat);
     const count = evaluateExpression(repeatMatch[1], ctx);
     for (let i = 0; i < count && i < 100000; i++) {
-      executeBlock(repeatMatch[2], ctx);
+      executeBlock(repeatBody, ctx);
     }
     return;
   }
