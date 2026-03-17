@@ -48,6 +48,7 @@ import { Input } from '@/components/ui/input';
 import { ZoomIn, ZoomOut, Maximize, Lock, Unlock, ChevronDown, Spline, Plus, Eye, Pencil, Trash2, Type, FileImage } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { verilogModuleToYosysJson } from '@/lib/verilog-to-yosys';
+import { toast } from 'sonner';
 
 // Lazy-loaded netlistsvg module + skin cache
 let netlistSvgModule: { render(skin: string, netlist: object): Promise<string> } | null = null;
@@ -1412,6 +1413,9 @@ function SchematicViewerInner({
   const handleToggleNetlistSvg = useCallback(async () => {
     if (showNetlistSvg) {
       setShowNetlistSvg(false);
+      toast.warning('Experimental Feature', {
+        description: 'Schematic editing is experimental and may not work as expected.',
+      });
       return;
     }
     if (!targetModule) return;

@@ -153,6 +153,24 @@
     color: var(--muted-foreground) !important;
   }
 
+  .toaster [data-sonner-toast][data-type="error"] {
+    border-color: var(--destructive) !important;
+  }
+
+  .toaster [data-sonner-toast][data-type="error"] [data-icon],
+  .toaster [data-sonner-toast][data-type="error"] [data-title] {
+    color: var(--destructive) !important;
+  }
+
+  .toaster [data-sonner-toast][data-type="warning"] {
+    border-color: var(--destructive) !important;
+  }
+
+  .toaster [data-sonner-toast][data-type="warning"] [data-icon],
+  .toaster [data-sonner-toast][data-type="warning"] [data-title] {
+    color: var(--destructive) !important;
+  }
+
   /* React Flow dark mode overrides */
   .dark .react-flow__edge-path {
     stroke: oklch(0.6 0 0);
