@@ -3,6 +3,15 @@ export interface SynthesisResult {
   log: string;
 }
 
+export class SynthesisError extends Error {
+  log: string;
+  constructor(message: string, log: string) {
+    super(message);
+    this.name = 'SynthesisError';
+    this.log = log;
+  }
+}
+
 export class YosysClient {
   private worker: Worker | null = null;
   private nextId = 1;
@@ -26,7 +35,7 @@ export class YosysClient {
         if (type === 'result') {
           p.resolve({ netlist, log });
         } else {
-          p.reject(new Error(error ?? 'Unknown synthesis error'));
+          p.reject(new SynthesisError(error ?? 'Unknown synthesis error', log ?? ''));
         }
       };
       this.worker.onerror = (e) => {

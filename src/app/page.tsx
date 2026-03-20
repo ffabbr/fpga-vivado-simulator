@@ -9,7 +9,7 @@ import {
 } from '@/lib/store';
 import { simulate, type SimulationResult } from '@/lib/verilog-simulator';
 import { parseVerilog } from '@/lib/verilog-parser';
-import { YosysClient } from '@/lib/yosys-client';
+import { YosysClient, SynthesisError } from '@/lib/yosys-client';
 import type { YosysNetlist } from '@/lib/gate-sim';
 import JSZip from 'jszip';
 import Toolbar from '@/components/layout/Toolbar';
@@ -241,8 +241,19 @@ export default function Home() {
         addConsoleMsg('warning', 'No constraints file (.xdc) found', 'Synthesis');
       }
     } catch (err) {
-      addConsoleMsg('error', `Synthesis failed: ${(err as Error).message}`, 'Synthesis');
-      toast.error('Synthesis failed', { description: (err as Error).message });
+      const message = (err as Error).message;
+      if (err instanceof SynthesisError && err.log) {
+        const lines = err.log.split('\n');
+        for (const line of lines) {
+          if (line.includes('ERROR') || line.includes('error')) {
+            addConsoleMsg('error', line, 'Yosys');
+          } else if (line.includes('Warning') || line.includes('warning')) {
+            addConsoleMsg('warning', line, 'Yosys');
+          }
+        }
+      }
+      addConsoleMsg('error', `Synthesis failed: ${message}`, 'Synthesis');
+      toast.error('Synthesis failed', { description: message });
       setNetlist(null);
     } finally {
       setIsSynthesizing(false);
@@ -701,6 +712,7 @@ export default function Home() {
                     requestedModuleName={schematicRequestedModule}
                     resetKey={schematicResetKey}
                     previewEdgeLabels={pendingSchematicEdits?.previewEdgeLabels ?? null}
+                    synthesizedNetlist={netlist}
                     onNavigateToModule={handleNavigateSchematicModule}
                     onEdgeDiffChange={handleSchematicEdgeDiff}
                     onConsoleMessage={addConsoleMsg}

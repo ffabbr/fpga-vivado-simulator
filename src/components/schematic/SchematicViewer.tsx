@@ -89,6 +89,7 @@ interface SchematicViewerProps {
   requestedModuleName?: string | null; // external module selection (e.g. sidebar file click)
   resetKey?: number; // increment to force re-build from source (e.g. after reject)
   previewEdgeLabels?: Record<string, string> | null;
+  synthesizedNetlist?: object | null; // Yosys JSON netlist from synthesis (used for accurate netlist SVG)
   onNavigateToModule?: (moduleName: string) => void;
   onEdgeDiffChange?: (diff: SchematicEdgeDiff, moduleName: string) => void;
   onConsoleMessage?: (type: 'info' | 'error' | 'success' | 'warning', message: string, source?: string) => void;
@@ -964,6 +965,7 @@ function SchematicViewerInner({
   requestedModuleName,
   resetKey,
   previewEdgeLabels,
+  synthesizedNetlist,
   onNavigateToModule,
   onEdgeDiffChange,
   onConsoleMessage,
@@ -1339,8 +1341,19 @@ function SchematicViewerInner({
     try {
       log('info', 'Loading netlistsvg module...');
       const { render, skin } = await getNetlistSvg();
-      log('info', 'Converting Verilog AST to Yosys JSON...');
-      const yosysJson = verilogModuleToYosysJson(mod, allModules);
+
+      // Prefer the real Yosys synthesis netlist when available — it correctly
+      // handles operators, always blocks, sequential logic, and all constructs
+      // that the hand-written AST converter cannot represent.
+      let yosysJson: object;
+      if (synthesizedNetlist) {
+        log('info', 'Using synthesized Yosys netlist...');
+        yosysJson = synthesizedNetlist;
+      } else {
+        log('info', 'No synthesis available, converting Verilog AST to Yosys JSON (limited)...');
+        yosysJson = verilogModuleToYosysJson(mod, allModules);
+      }
+
       log('info', 'Rendering SVG layout...');
       let svg = await render(skin, yosysJson);
       // Pre-process SVG: extract dimensions and add viewBox so the inline ref
@@ -1368,7 +1381,7 @@ function SchematicViewerInner({
     } finally {
       setIsRenderingNetlist(false);
     }
-  }, [onConsoleMessage, allModules]);
+  }, [onConsoleMessage, allModules, synthesizedNetlist]);
 
   // SVG pan/zoom handlers — use native wheel listener to allow preventDefault on non-passive event
   const handleSvgWheelRef = useRef<(e: WheelEvent) => void>(null);
@@ -1486,6 +1499,17 @@ function SchematicViewerInner({
       renderNetlistSvg(targetModule);
     }
   }, [showNetlistSvg, targetModule, renderNetlistSvg]);
+
+  // Re-render SVG when a new synthesis completes while in SVG mode
+  const prevNetlistRef = useRef(synthesizedNetlist);
+  useEffect(() => {
+    if (synthesizedNetlist !== prevNetlistRef.current) {
+      prevNetlistRef.current = synthesizedNetlist;
+      if (showNetlistSvg && targetModule) {
+        renderNetlistSvg(targetModule);
+      }
+    }
+  }, [synthesizedNetlist, showNetlistSvg, targetModule, renderNetlistSvg]);
 
   // Right-click position capture (screen → flow coords)
   const handlePaneContextMenu = useCallback((event: React.MouseEvent) => {
