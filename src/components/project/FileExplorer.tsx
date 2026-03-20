@@ -271,7 +271,7 @@ export default function FileExplorer({
                               onClick={e => e.stopPropagation()}
                             />
                           ) : (
-                            <span className="truncate text-xs">{file.name}</span>
+                            <span className="truncate text-xs font-medium">{file.name}</span>
                           )}
                           {topModule && file.type === 'verilog' && file.content.includes(`module ${topModule}`) && (
                             <Badge variant="outline" className="h-4 text-[9px] px-1 border-muted-foreground/50 text-muted-foreground">
