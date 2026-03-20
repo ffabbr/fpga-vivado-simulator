@@ -78,12 +78,26 @@ export function projectReducer(state: ProjectState, action: ProjectAction): Proj
       return { ...state, name: action.name };
 
     case 'ADD_FILE': {
-      const files = [...state.files, action.file];
+      // Prevent duplicate filenames — deduplicate by appending _N suffix
+      let finalName = action.file.name;
+      const existingNames = new Set(state.files.map(f => f.name));
+      if (existingNames.has(finalName)) {
+        const ext = finalName.lastIndexOf('.');
+        const base = ext > 0 ? finalName.slice(0, ext) : finalName;
+        const extension = ext > 0 ? finalName.slice(ext) : '';
+        let n = 1;
+        while (existingNames.has(`${base}_${n}${extension}`)) n++;
+        finalName = `${base}_${n}${extension}`;
+      }
+      const file = finalName !== action.file.name
+        ? { ...action.file, name: finalName, path: `/${finalName}` }
+        : action.file;
+      const files = [...state.files, file];
       return {
         ...state,
         files,
-        activeFileId: action.file.id,
-        openFileIds: [...state.openFileIds, action.file.id],
+        activeFileId: file.id,
+        openFileIds: [...state.openFileIds, file.id],
       };
     }
 
@@ -97,7 +111,10 @@ export function projectReducer(state: ProjectState, action: ProjectAction): Proj
         ),
       };
 
-    case 'RENAME_FILE':
+    case 'RENAME_FILE': {
+      // Prevent duplicate filenames on rename
+      const nameExists = state.files.some(f => f.id !== action.id && f.name === action.name);
+      if (nameExists) return state;
       return {
         ...state,
         files: state.files.map(f =>
@@ -106,6 +123,7 @@ export function projectReducer(state: ProjectState, action: ProjectAction): Proj
             : f
         ),
       };
+    }
 
     case 'DELETE_FILE': {
       const files = state.files.filter(f => f.id !== action.id);

@@ -25,6 +25,7 @@ import {
   DialogHeader, DialogTitle,
 } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
+import { toast } from 'sonner';
 import { ProjectFile, createFile } from '@/lib/store';
 
 interface FileExplorerProps {
@@ -148,6 +149,11 @@ export default function FileExplorer({
       else if (newFileType === 'constraints') finalName += '.xdc';
     }
 
+    if (files.some(f => f.name === finalName)) {
+      toast.error('A file with that name already exists');
+      return;
+    }
+
     const type = newFileType;
     let template = '';
     if (type === 'verilog') {
@@ -164,16 +170,21 @@ export default function FileExplorer({
     onAddFile(file);
     setNewFileName('');
     setIsCreateDialogOpen(false);
-  }, [newFileName, newFileType, onAddFile]);
+  }, [newFileName, newFileType, onAddFile, files]);
 
   const handleRename = useCallback((id: string) => {
     if (!renameValue.trim()) {
       setRenamingId(null);
       return;
     }
+    if (files.some(f => f.id !== id && f.name === renameValue.trim())) {
+      toast.error('A file with that name already exists');
+      setRenamingId(null);
+      return;
+    }
     onRenameFile(id, renameValue);
     setRenamingId(null);
-  }, [renameValue, onRenameFile]);
+  }, [renameValue, onRenameFile, files]);
 
   const handleDuplicate = useCallback((file: ProjectFile) => {
     const ext = file.name.lastIndexOf('.');
