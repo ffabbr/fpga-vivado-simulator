@@ -139,14 +139,14 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
       if (portMapping) {
         const boardOut = userOutputsToBoardOutputs(rawResult, portMapping);
         led = boardOut.led ?? 0;
-        seg = boardOut.seg ?? 0x7F;
-        dp = boardOut.dp ?? 1;
-        an = boardOut.an ?? 0xF;
+        seg = boardOut.seg ?? 0;
+        dp = boardOut.dp ?? 0;
+        an = boardOut.an ?? 0;
       } else {
         led = rawResult.led ?? 0;
-        seg = rawResult.seg ?? 0x7F;
-        dp = rawResult.dp ?? 1;
-        an = rawResult.an ?? 0xF;
+        seg = rawResult.seg ?? 0;
+        dp = rawResult.dp ?? 0;
+        an = rawResult.an ?? 0;
       }
       setOutputs({ led, seg, dp, an });
       // For combinational designs, set per-digit state directly from an/seg
@@ -214,13 +214,13 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
         let an: number, seg: number, dp: number;
         if (mapping) {
           const boardOut = userOutputsToBoardOutputs(lastResult, mapping);
-          an = boardOut.an ?? 0xF;
-          seg = boardOut.seg ?? 0x7F;
-          dp = boardOut.dp ?? 1;
+          an = boardOut.an ?? 0;
+          seg = boardOut.seg ?? 0;
+          dp = boardOut.dp ?? 0;
         } else {
-          an = lastResult.an ?? 0xF;
-          seg = lastResult.seg ?? 0x7F;
-          dp = lastResult.dp ?? 1;
+          an = lastResult.an ?? 0;
+          seg = lastResult.seg ?? 0;
+          dp = lastResult.dp ?? 0;
         }
 
         for (let d = 0; d < 4; d++) {
@@ -273,9 +273,9 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
       setOutputs(prev => {
         const next = {
           led: finalOut.led ?? 0,
-          seg: finalOut.seg ?? 0x7F,
-          dp: finalOut.dp ?? 1,
-          an: finalOut.an ?? 0xF,
+          seg: finalOut.seg ?? 0,
+          dp: finalOut.dp ?? 0,
+          an: finalOut.an ?? 0,
         };
         if (prev.led === next.led && prev.seg === next.seg && prev.dp === next.dp && prev.an === next.an) return prev;
         return next;
