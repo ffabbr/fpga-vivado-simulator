@@ -1,9 +1,9 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import {
   FileText, FilePlus2, Trash2, Pencil, Copy,
-  FileCode2, TestTube2, Settings2, Cpu, ChevronDown, MoreHorizontal,
+  FileCode2, TestTube2, Settings2, Cpu, ChevronDown, MoreHorizontal, Upload,
 } from 'lucide-react';
 import { Spinner } from '@/components/ui/spinner';
 import { Button } from '@/components/ui/button';
@@ -61,6 +61,57 @@ export default function FileExplorer({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<ProjectFile | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounter = useRef(0);
+
+  const detectFileType = useCallback((name: string): ProjectFile['type'] => {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.xdc')) return 'constraints';
+    if (lower.endsWith('_tb.v') || lower.endsWith('_tb.sv')) return 'testbench';
+    if (lower.endsWith('.v') || lower.endsWith('.sv') || lower.endsWith('.vh')) return 'verilog';
+    return 'other';
+  }, []);
+
+  const handleDroppedFiles = useCallback((droppedFiles: FileList) => {
+    Array.from(droppedFiles).forEach(file => {
+      const name = file.name;
+      const type = detectFileType(name);
+      if (type === 'other') return; // skip unsupported files
+      file.text().then(content => {
+        onAddFile(createFile(name, content, type));
+      });
+    });
+  }, [detectFileType, onAddFile]);
+
+  const onDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current++;
+    if (e.dataTransfer.types.includes('Files')) {
+      setIsDragOver(true);
+    }
+  }, []);
+
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }, []);
+
+  const onDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current--;
+    if (dragCounter.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const onDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounter.current = 0;
+    setIsDragOver(false);
+    if (e.dataTransfer.files.length > 0) {
+      handleDroppedFiles(e.dataTransfer.files);
+    }
+  }, [handleDroppedFiles]);
 
   const initCreateDefaults = useCallback(() => {
     setNewFileType('verilog');
@@ -142,7 +193,19 @@ export default function FileExplorer({
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div
+      className="flex flex-col h-full relative"
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {/* Drop overlay */}
+      <div className={`absolute inset-0 z-50 bg-muted/70 backdrop-blur-sm border-2 border-dashed border-muted-foreground/40 rounded-lg flex flex-col items-center justify-center gap-2 pointer-events-none transition-opacity duration-200 ease-in-out ${isDragOver ? 'opacity-100' : 'opacity-0'}`}>
+        <Upload className="h-8 w-8 text-muted-foreground" />
+        <span className="text-sm font-medium text-muted-foreground">Drop .v or .xdc files</span>
+      </div>
+
       {/* Add file button */}
       <div className="px-4 py-3">
         <Button variant="outline" size="sm" className="w-full h-7 text-xs" onClick={openCreateDialog}>
