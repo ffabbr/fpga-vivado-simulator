@@ -605,7 +605,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
                      <div className="flex flex-col items-center gap-1 w-8">
                        <span className="text-[8px] font-bold text-white mb-1">{ledPortNames[i]}</span>
                        <div
-                         className={`w-3 h-2 rounded-[1px] transition-all duration-75 shadow-sm ${
+                         className={`w-3 h-2 rounded-[1px] shadow-sm ${
                            isOn
                              ? 'bg-yellow-400'
                              : 'bg-zinc-600/50'
