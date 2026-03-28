@@ -119,6 +119,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
   const [digitSegments, setDigitSegments] = useState<number[]>([0x7F, 0x7F, 0x7F, 0x7F]);
   const [digitDp, setDigitDp] = useState<number[]>([1, 1, 1, 1]);
   const [outputs, setOutputs] = useState({ led: 0, seg: 0x7F, dp: 1, an: 0xF });
+  const [ledDuty, setLedDuty] = useState<number[]>(new Array(16).fill(0));
 
   // Check if the design uses a clock input (check board signal, not user port name)
   const hasClock = useMemo(() => {
@@ -182,24 +183,31 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
       return;
     }
 
-    // Sequential design — run a clock simulation
-    // We run many clock cycles per interval to advance counters quickly
-    const CYCLES_PER_TICK = 8192;
+    // Sequential design — run a clock simulation.
+    // Use a time-budget approach: run as many cycles as we can fit in ~12ms
+    // per frame, so designs with large clock dividers remain usable.
     const TICK_INTERVAL_MS = 16; // ~60fps
+    const TIME_BUDGET_MS = 12;   // leave ~4ms headroom for rendering
+    const MIN_CYCLES = 64;
+    // Fast-forward is O(1), so we can safely request millions of cycles
+    // when it's active — only ~32 are actually simulated per frame.
+    // 2M cycles ≈ real-time 100MHz equivalent for a 24-bit clock divider.
+    const MAX_CYCLES = gateSim.hasCounterFastForward ? 1_000_000 : 262_143;
 
     clkRef.current = 0;
 
     const sim = gateSim;
 
-    // Core simulation: clock N cycles, return captured per-digit state
+    // Core simulation: clock N cycles using runCycles().
+    // FSM designs get counter fast-forward + early-break.
+    // PWM designs run full batch; duty cycle is counted here.
     function simulateCycles(
       count: number,
       digitSeg: (number | null)[],
       digitDpArr: (number | null)[],
-    ): Record<string, number> {
+    ): { lastResult: Record<string, number>; duty: number[] | null } {
       const mapping = portMappingRef.current;
       const baseInputs = boardInputsRef.current;
-      let lastResult: Record<string, number> = {};
 
       const risingInputs = mapping
         ? boardInputsToUserPorts({ ...baseInputs, clk: 1 }, mapping)
@@ -208,31 +216,37 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
         ? boardInputsToUserPorts({ ...baseInputs, clk: 0 }, mapping)
         : { ...baseInputs, clk: 0 };
 
-      for (let i = 0; i < count; i++) {
-        lastResult = sim.evaluate(risingInputs);
+      // Duty-cycle tracking for PWM designs
+      const ledOnCounts = new Array(16).fill(0);
+      let totalSamples = 0;
 
-        let an: number, seg: number, dp: number;
-        if (mapping) {
-          const boardOut = userOutputsToBoardOutputs(lastResult, mapping);
-          an = boardOut.an ?? 0;
-          seg = boardOut.seg ?? 0;
-          dp = boardOut.dp ?? 0;
-        } else {
-          an = lastResult.an ?? 0;
-          seg = lastResult.seg ?? 0;
-          dp = lastResult.dp ?? 0;
+      const lastResult = sim.runCycles(count, risingInputs, fallingInputs, (midOut) => {
+        const boardOut = mapping ? userOutputsToBoardOutputs(midOut, mapping) : midOut;
+
+        // Count LED on-time for duty cycle display
+        const led = boardOut.led ?? 0;
+        totalSamples++;
+        for (let i = 0; i < 16; i++) {
+          if ((led >> i) & 1) ledOnCounts[i]++;
         }
 
+        // Capture 7-seg digit state
+        const an = boardOut.an ?? 0;
+        const seg = boardOut.seg ?? 0;
+        const dp = boardOut.dp ?? 0;
         for (let d = 0; d < 4; d++) {
           if (!((an >> d) & 1)) {
             digitSeg[d] = seg;
             digitDpArr[d] = dp;
           }
         }
+      });
 
-        lastResult = sim.evaluate(fallingInputs);
-      }
-      return lastResult;
+      const duty = totalSamples > 0
+        ? ledOnCounts.map((c: number) => c / totalSamples)
+        : null;
+
+      return { lastResult, duty };
     }
 
     // Flush captured digit state to React
@@ -240,6 +254,7 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
       digitSeg: (number | null)[],
       digitDpArr: (number | null)[],
       lastResult: Record<string, number>,
+      duty: number[] | null,
     ) {
       setDigitSegments(prev => {
         const next = [...prev];
@@ -280,16 +295,40 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
         if (prev.led === next.led && prev.seg === next.seg && prev.dp === next.dp && prev.an === next.an) return prev;
         return next;
       });
+
+      setLedDuty(duty ?? [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
     }
 
     // Ongoing: clock continuously — digits appear progressively as
-    // counters advance. No synchronous warm-up to avoid blocking the UI.
+    // counters advance. Adaptive cycle count based on time budget so
+    // large clock dividers (e.g. 25-bit counters) remain usable.
+    let adaptiveCycles = MIN_CYCLES;
+    let frameCount = 0;
     const intervalId = setInterval(() => {
       try {
         const digitSeg: (number | null)[] = [null, null, null, null];
         const digitDpArr: (number | null)[] = [null, null, null, null];
-        const lastResult = simulateCycles(CYCLES_PER_TICK, digitSeg, digitDpArr);
-        flushState(digitSeg, digitDpArr, lastResult);
+        // Add a per-frame offset (0–31) to break alignment with common
+        // counter periods (2,4,8,16).  Without this, the adaptive cycle
+        // count is always a power-of-2 multiple of 64, which is a multiple
+        // of every small counter period — so outputs that toggle on tick
+        // boundaries toggle an even number of times and appear stuck.
+        const offset = (frameCount++) & 31;
+        const count = adaptiveCycles + offset;
+        const t0 = performance.now();
+        const { lastResult, duty } = simulateCycles(count, digitSeg, digitDpArr);
+        const elapsed = performance.now() - t0;
+
+        // Adapt cycle count purely based on time budget.
+        // No output-change throttling — PWM designs toggle outputs every
+        // frame and throttling would starve them of cycles.
+        if (elapsed < TIME_BUDGET_MS * 0.5) {
+          adaptiveCycles = Math.min(adaptiveCycles * 2, MAX_CYCLES);
+        } else if (elapsed > TIME_BUDGET_MS) {
+          adaptiveCycles = Math.max(Math.floor(adaptiveCycles * 0.5), MIN_CYCLES);
+        }
+
+        flushState(digitSeg, digitDpArr, lastResult, duty);
       } catch (e) {
         console.warn('Board clock simulation error:', e);
       }
@@ -552,7 +591,13 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
           {/* LEDs Array */}
           <div className="absolute bottom-[70px] left-0 w-full px-[54px] flex justify-between flex-row-reverse">
              {Array.from({ length: 16 }, (_, i) => {
-               const isOn = powerOn && ((outputs.led >> i) & 1);
+               const duty = ledDuty[i] ?? 0;
+               const binaryOn = (outputs.led >> i) & 1;
+               // Use duty cycle for proportional brightness when it's fractional (PWM).
+               // Fall back to binary on/off for FSM-type outputs (duty ≈ 0 or ≈ 1).
+               const isPWM = duty > 0.02 && duty < 0.98;
+               const brightness = isPWM ? duty : (binaryOn ? 1 : 0);
+               const isOn = powerOn && brightness > 0;
                const ledPortNames = ['U16','E19','U19','V19','W18','U15','U14','V14','V13','V3','W3','U3','P3','N3','P1','L1'];
                return (
                  <Tooltip key={`led-${i}`}>
@@ -562,14 +607,18 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
                        <div
                          className={`w-3 h-2 rounded-[1px] transition-all duration-75 shadow-sm ${
                            isOn
-                             ? 'bg-yellow-400 shadow-[0_0_8px_rgba(250,204,21,0.9)]'
+                             ? 'bg-yellow-400'
                              : 'bg-zinc-600/50'
                          }`}
+                         style={isOn ? {
+                           boxShadow: `0 0 ${Math.round(8 * brightness)}px rgba(250, 204, 21, ${(brightness * 0.9).toFixed(2)})`,
+                           opacity: Math.max(brightness, 0.15),
+                         } : undefined}
                        />
                      </div>
                    </TooltipTrigger>
                    <TooltipContent className="text-xs">
-                      LED[{i}]
+                      LED[{i}]{isPWM ? ` (${Math.round(duty * 100)}%)` : ''}
                    </TooltipContent>
                  </Tooltip>
                );
@@ -641,6 +690,9 @@ function BoardButton({
         onMouseDown={onPress}
         onMouseUp={onRelease}
         onMouseLeave={onRelease}
+        onTouchStart={onPress}
+        onTouchEnd={onRelease}
+        onTouchCancel={onRelease}
       >
         {label}
       </button>
