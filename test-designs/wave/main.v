@@ -36,7 +36,7 @@ module main(
     
 //    Multiplexer multi (ari_out, logic_out, AluOp[2], out);
 
-    bad_ALU alu (a, b, AluOp, out);
+    bad_ALU alu (A, B, AluOp, out);
     assign zero = ~|out;
     
     

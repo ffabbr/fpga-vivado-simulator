@@ -16,6 +16,7 @@ export interface VerilogParam {
 
 export interface VerilogAssign {
   target: string;
+  targetRaw?: string;
   targetBit?: number;
   targetMsb?: number;
   targetLsb?: number;
@@ -114,43 +115,146 @@ function extractBalancedBlock(src: string, startIdx: number): string | null {
   return null;
 }
 
-function parseWidth(widthStr: string): { width: number; msb: number; lsb: number } {
-  const match = widthStr.match(/\[(\d+):(\d+)\]/);
+function splitTopLevel(src: string, delimiter = ','): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let paren = 0;
+  let bracket = 0;
+  let brace = 0;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === '(') paren++;
+    else if (c === ')') paren = Math.max(0, paren - 1);
+    else if (c === '[') bracket++;
+    else if (c === ']') bracket = Math.max(0, bracket - 1);
+    else if (c === '{') brace++;
+    else if (c === '}') brace = Math.max(0, brace - 1);
+    else if (c === delimiter && paren === 0 && bracket === 0 && brace === 0) {
+      out.push(src.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const last = src.slice(start).trim();
+  if (last) out.push(last);
+  return out;
+}
+
+function parseConstNumber(src: string): number | null {
+  const s = src.trim().replace(/_/g, '');
+  const sized = s.match(/^(?:\d+)?'[sS]?([bBoOdDhH])([0-9a-fA-FxXzZ?]+)$/);
+  if (sized) {
+    if (/[xXzZ?]/.test(sized[2])) return null;
+    const radix = sized[1].toLowerCase() === 'b' ? 2 : sized[1].toLowerCase() === 'o' ? 8 : sized[1].toLowerCase() === 'h' ? 16 : 10;
+    return parseInt(sized[2], radix);
+  }
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  return null;
+}
+
+function evalConstExpr(src: string, params: Map<string, number>): number | null {
+  const toks = src.match(/(?:\d+)?'[sS]?[bBoOdDhH][0-9a-fA-FxXzZ?_]+|\d+|[A-Za-z_]\w*|<<|>>|[()+\-*/%]/g) || [];
+  let i = 0;
+  const peek = () => toks[i];
+  const next = () => toks[i++];
+
+  const parsePrimary = (): number | null => {
+    const t = next();
+    if (!t) return null;
+    if (t === '(') {
+      const v = parseAdd();
+      if (next() !== ')') return null;
+      return v;
+    }
+    if (/^[A-Za-z_]\w*$/.test(t)) return params.get(t) ?? null;
+    return parseConstNumber(t);
+  };
+  const parseUnary = (): number | null => {
+    if (peek() === '+') { next(); return parseUnary(); }
+    if (peek() === '-') { next(); const v = parseUnary(); return v === null ? null : -v; }
+    return parsePrimary();
+  };
+  const parseMul = (): number | null => {
+    let v = parseUnary();
+    while (v !== null && peek() !== undefined && ['*', '/', '%'].includes(peek()!)) {
+      const op = next();
+      const r = parseUnary();
+      if (r === null) return null;
+      if (op === '*') v *= r;
+      else if (op === '/') v = r === 0 ? null : Math.trunc(v / r);
+      else v = r === 0 ? null : v % r;
+    }
+    return v;
+  };
+  const parseAdd = (): number | null => {
+    let v = parseMul();
+    while (v !== null && peek() !== undefined && ['+', '-', '<<', '>>'].includes(peek()!)) {
+      const op = next();
+      const r = parseMul();
+      if (r === null) return null;
+      if (op === '+') v += r;
+      else if (op === '-') v -= r;
+      else if (op === '<<') v <<= r;
+      else v >>= r;
+    }
+    return v;
+  };
+
+  const result = parseAdd();
+  return result !== null && i === toks.length ? result : null;
+}
+
+function parseWidth(widthStr: string, params = new Map<string, number>()): { width: number; msb: number; lsb: number } {
+  const match = widthStr.match(/\[([^:\]]+):([^\]]+)\]/);
   if (match) {
-    const msb = parseInt(match[1]);
-    const lsb = parseInt(match[2]);
-    return { width: msb - lsb + 1, msb, lsb };
+    const msb = evalConstExpr(match[1], params);
+    const lsb = evalConstExpr(match[2], params);
+    if (msb !== null && lsb !== null) {
+      return { width: Math.abs(msb - lsb) + 1, msb, lsb };
+    }
   }
   return { width: 1, msb: 0, lsb: 0 };
 }
 
-function parsePorts(portSection: string, bodySection: string): VerilogPort[] {
+function parsePorts(portSection: string, bodySection: string, params: Map<string, number>): VerilogPort[] {
   const ports: VerilogPort[] = [];
 
   // Try ANSI-style ports (direction in port list)
-  const ansiPortRegex = /\b(input|output|inout)\s*(reg\s+)?\s*(\[\d+:\d+\])?\s*(\w+)/g;
-  let match;
-
-  // Check in port list first
-  while ((match = ansiPortRegex.exec(portSection)) !== null) {
-    const direction = match[1] as 'input' | 'output' | 'inout';
-    const isReg = !!match[2];
-    const widthStr = match[3] || '';
-    const { width, msb, lsb } = parseWidth(widthStr);
-    ports.push({ name: match[4], direction, width, msb, lsb, isReg });
+  let current: { direction: 'input' | 'output' | 'inout'; isReg: boolean; widthStr: string } | null = null;
+  for (const part of splitTopLevel(portSection)) {
+    const m = part.match(/^(?:(input|output|inout)\b\s*)?(?:(wire|reg|logic)\b\s*)?(?:signed\s+)?(\[[^\]]+\]\s*)?(.+)$/);
+    if (!m) continue;
+    if (m[1]) {
+      current = {
+        direction: m[1] as 'input' | 'output' | 'inout',
+        isReg: m[2] === 'reg' || m[2] === 'logic',
+        widthStr: (m[3] || '').trim(),
+      };
+    } else if (current && (m[2] || m[3])) {
+      current = {
+        direction: current.direction,
+        isReg: m[2] ? (m[2] === 'reg' || m[2] === 'logic') : current.isReg,
+        widthStr: (m[3] || current.widthStr).trim(),
+      };
+    }
+    if (!current) continue;
+    const nameMatch = m[4].trim().match(/^(\w+)/);
+    if (!nameMatch) continue;
+    const { width, msb, lsb } = parseWidth(current.widthStr, params);
+    ports.push({ name: nameMatch[1], direction: current.direction, width, msb, lsb, isReg: current.isReg });
   }
 
   if (ports.length > 0) return ports;
 
   // Non-ANSI style: port names in module header, directions in body
   const portNames: string[] = portSection.match(/\w+/g) || [];
-  const dirRegex = /\b(input|output|inout)\s+(reg\s+)?(\[\d+:\d+\])?\s*(\w+(?:\s*,\s*\w+)*)\s*;/g;
+  const dirRegex = /\b(input|output|inout)\s+(?:(wire|reg|logic)\s+)?(?:signed\s+)?(\[[^\]]+\])?\s*(\w+(?:\s*,\s*\w+)*)\s*;/g;
+  let match;
 
   while ((match = dirRegex.exec(bodySection)) !== null) {
     const direction = match[1] as 'input' | 'output' | 'inout';
-    const isReg = !!match[2];
+    const isReg = match[2] === 'reg' || match[2] === 'logic';
     const widthStr = match[3] || '';
-    const { width, msb, lsb } = parseWidth(widthStr);
+    const { width, msb, lsb } = parseWidth(widthStr, params);
     const names = match[4].split(',').map(n => n.trim());
     for (const name of names) {
       if (portNames.includes(name)) {
@@ -162,13 +266,13 @@ function parsePorts(portSection: string, bodySection: string): VerilogPort[] {
   return ports;
 }
 
-function parseWires(body: string): VerilogWire[] {
+function parseWires(body: string, params: Map<string, number>): VerilogWire[] {
   const wires: VerilogWire[] = [];
-  const regex = /\bwire\s+(\[\d+:\d+\])?\s*(\w+(?:\s*,\s*\w+)*)\s*;/g;
+  const regex = /\bwire\b\s*(?:signed\s+)?(\[[^\]]+\])?\s*(\w+(?:\s*,\s*\w+)*)\s*;/g;
   let match;
   while ((match = regex.exec(body)) !== null) {
     const widthStr = match[1] || '';
-    const { width, msb, lsb } = parseWidth(widthStr);
+    const { width, msb, lsb } = parseWidth(widthStr, params);
     const names = match[2].split(',').map(n => n.trim());
     for (const name of names) {
       wires.push({ name, width, msb, lsb });
@@ -177,13 +281,13 @@ function parseWires(body: string): VerilogWire[] {
   return wires;
 }
 
-function parseRegs(body: string): VerilogReg[] {
+function parseRegs(body: string, params: Map<string, number>): VerilogReg[] {
   const regs: VerilogReg[] = [];
-  const regex = /\breg\s+(\[\d+:\d+\])?\s*(\w+(?:\s*,\s*\w+)*)\s*;/g;
+  const regex = /\breg\b\s*(?:signed\s+)?(\[[^\]]+\])?\s*(\w+(?:\s*,\s*\w+)*)\s*;/g;
   let match;
   while ((match = regex.exec(body)) !== null) {
     const widthStr = match[1] || '';
-    const { width, msb, lsb } = parseWidth(widthStr);
+    const { width, msb, lsb } = parseWidth(widthStr, params);
     const names = match[2].split(',').map(n => n.trim());
     for (const name of names) {
       regs.push({ name, width, msb, lsb });
@@ -202,15 +306,18 @@ function parseRegs(body: string): VerilogReg[] {
 
 function parseAssigns(body: string): VerilogAssign[] {
   const assigns: VerilogAssign[] = [];
-  const regex = /\bassign\s+(\w+)(\[\d+(?::\d+)?\])?\s*=\s*([^;]+);/g;
+  const regex = /\bassign\s+(.+?)\s*=\s*([^;]+);/g;
   let match;
   while ((match = regex.exec(body)) !== null) {
+    const targetRaw = match[1].trim();
+    const targetMatch = targetRaw.match(/^(\w+)(\[\d+(?::\d+)?\])?$/);
     const assign: VerilogAssign = {
-      target: match[1],
-      expression: match[3].trim(),
+      target: targetMatch?.[1] ?? targetRaw,
+      targetRaw,
+      expression: match[2].trim(),
     };
-    if (match[2]) {
-      const bitMatch = match[2].match(/\[(\d+)(?::(\d+))?\]/);
+    if (targetMatch?.[2]) {
+      const bitMatch = targetMatch[2].match(/\[(\d+)(?::(\d+))?\]/);
       if (bitMatch) {
         if (bitMatch[2] !== undefined) {
           assign.targetMsb = parseInt(bitMatch[1]);
@@ -297,24 +404,74 @@ function parseInitialBlocks(body: string): VerilogInitialBlock[] {
         headerRegex.lastIndex = beginIdx + extracted.length;
       }
     } else {
-      const semi = body.indexOf(';', afterHeader);
-      if (semi !== -1) {
-        blocks.push({ body: body.slice(afterHeader, semi + 1).trim() });
-        headerRegex.lastIndex = semi + 1;
+      const end = findStatementEnd(body, afterHeader);
+      if (end !== -1) {
+        blocks.push({ body: body.slice(afterHeader, end).trim() });
+        headerRegex.lastIndex = end;
       }
     }
   }
   return blocks;
 }
 
-function parseParams(body: string): VerilogParam[] {
+function parseParams(paramSection: string, body: string): VerilogParam[] {
   const params: VerilogParam[] = [];
-  const regex = /\bparameter\s+(\w+)\s*=\s*(\d+)/g;
+  const seen = new Set<string>();
+  const addParam = (part: string) => {
+    const cleaned = part
+      .replace(/^\s*(?:parameter|localparam)\b/, '')
+      .replace(/^\s*(?:integer|real|time|signed)\b/, '')
+      .replace(/^\s*\[[^\]]+\]/, '')
+      .trim();
+    const match = cleaned.match(/^(\w+)\s*=\s*(.+)$/);
+    if (!match || seen.has(match[1])) return;
+    const current = new Map(params.map(p => [p.name, p.value]));
+    const value = parseConstNumber(match[2]) ?? evalConstExpr(match[2], current);
+    if (value === null) return;
+    seen.add(match[1]);
+    params.push({ name: match[1], value });
+  };
+  for (const part of splitTopLevel(paramSection)) addParam(part);
+  const bodyParamRe = /\b(?:localparam|parameter)\b\s+([^;]+);/g;
   let match;
-  while ((match = regex.exec(body)) !== null) {
-    params.push({ name: match[1], value: parseInt(match[2]) });
+  while ((match = bodyParamRe.exec(body)) !== null) {
+    for (const part of splitTopLevel(match[1])) addParam(part);
   }
   return params;
+}
+
+function paramsToMap(params: VerilogParam[]): Map<string, number> {
+  return new Map(params.map(p => [p.name, p.value]));
+}
+
+function compareConst(left: number, op: string, right: number): boolean {
+  switch (op) {
+    case '<': return left < right;
+    case '<=': return left <= right;
+    case '>': return left > right;
+    case '>=': return left >= right;
+    case '!=': return left !== right;
+    case '==': return left === right;
+  }
+  return false;
+}
+
+function expandGenerateBlocks(body: string, params: Map<string, number>): string {
+  const genForRe = /(?:\bgenvar\s+\w+\s*;\s*)?\bgenerate\s+for\s*\(\s*(\w+)\s*=\s*([^;]+?)\s*;\s*\1\s*(<=|>=|==|!=|<|>)\s*([^;]+?)\s*;\s*\1\s*=\s*\1\s*([+-])\s*([^)]+?)\s*\)\s*begin(?:\s*:\s*\w+)?([\s\S]*?)\bend\s*endgenerate\b/g;
+  return body.replace(genForRe, (_all, iterName: string, startSrc: string, op: string, endSrc: string, stepOp: string, stepSrc: string, genBody: string) => {
+    const start = evalConstExpr(startSrc, params);
+    const end = evalConstExpr(endSrc, params);
+    const step = evalConstExpr(stepSrc, params);
+    if (start === null || end === null || step === null || step === 0) return '';
+    const out: string[] = [];
+    let value = start;
+    let guard = 0;
+    while (compareConst(value, op, end) && guard++ < 10000) {
+      out.push(genBody.replace(new RegExp(`\\b${iterName}\\b`, 'g'), String(value)));
+      value = stepOp === '+' ? value + step : value - step;
+    }
+    return out.join('\n');
+  }).replace(/\bgenvar\s+\w+\s*;/g, '');
 }
 
 const GATE_PRIMITIVES = new Set([
@@ -384,27 +541,31 @@ export function parseVerilog(source: string): ParseResult {
   const modules: VerilogModule[] = [];
   const cleaned = stripComments(source);
 
-  const moduleRegex = /\bmodule\s+(\w+)\s*(?:#\s*\([^)]*\))?\s*(?:\(([^)]*)\))?\s*;([\s\S]*?)\bendmodule\b/g;
+  const moduleRegex = /\bmodule\s+(\w+)\s*(?:#\s*\(([^)]*)\))?\s*(?:\(([^)]*)\))?\s*;([\s\S]*?)\bendmodule\b/g;
   let match;
 
   while ((match = moduleRegex.exec(cleaned)) !== null) {
     const name = match[1];
-    const portSection = match[2] || '';
-    const body = match[3];
+    const paramSection = match[2] || '';
+    const portSection = match[3] || '';
+    const body = match[4];
 
     try {
+      const params = parseParams(paramSection, body);
+      const paramMap = paramsToMap(params);
+      const expandedBody = expandGenerateBlocks(body, paramMap);
       const mod: VerilogModule = {
         name,
-        ports: parsePorts(portSection, body),
-        params: parseParams(body),
-        wires: parseWires(body),
-        regs: parseRegs(body),
-        assigns: parseAssigns(body),
-        alwaysBlocks: parseAlwaysBlocks(body),
-        initialBlocks: parseInitialBlocks(body),
-        instances: parseInstances(body),
-        gatePrimitives: parseGatePrimitives(body),
-        raw: match[0],
+        ports: parsePorts(portSection, expandedBody, paramMap),
+        params,
+        wires: parseWires(expandedBody, paramMap),
+        regs: parseRegs(expandedBody, paramMap),
+        assigns: parseAssigns(expandedBody),
+        alwaysBlocks: parseAlwaysBlocks(expandedBody),
+        initialBlocks: parseInitialBlocks(expandedBody),
+        instances: parseInstances(expandedBody),
+        gatePrimitives: parseGatePrimitives(expandedBody),
+        raw: match[0].replace(body, expandedBody),
       };
       modules.push(mod);
     } catch (e) {

@@ -7,7 +7,7 @@ import {
 } from '@/lib/verilog-simulator';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { ZoomIn, ZoomOut, Maximize2, ChevronLeft, ChevronRight, Search } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize2, ChevronLeft, ChevronRight, Search, Download } from 'lucide-react';
 
 interface WaveformViewerProps {
   simulation: SimulationResult | null;
@@ -21,6 +21,8 @@ const COLORS = [
   '#22c55e', '#3b82f6', '#eab308', '#ef4444', '#a855f7',
   '#06b6d4', '#f97316', '#ec4899', '#14b8a6', '#8b5cf6',
 ];
+const EMPTY_TRACES: SignalTrace[] = [];
+const EMPTY_TRACE_MAP: Record<string, SignalTrace> = {};
 
 function getThemeColors() {
   const isDark = document.documentElement.classList.contains('dark');
@@ -42,8 +44,10 @@ function getThemeColors() {
 // Default signal selection: testbench-scope only (one dot in path = top-only)
 function defaultPick(traces: SignalTrace[]): string[] {
   const top = traces.filter(t => t.name.split('.').length === 2);
-  if (top.length === 0) return traces.slice(0, 12).map(t => t.name);
-  return top.slice(0, 24).map(t => t.name);
+  const internal = traces.filter(t => t.name.split('.').length > 2 || t.isMemory);
+  const picked = [...top.slice(0, 12), ...internal.slice(0, 12)];
+  if (picked.length === 0) return traces.slice(0, 24).map(t => t.name);
+  return picked.map(t => t.name);
 }
 
 // Binary-search: find the index of the last change at or before time t
@@ -81,8 +85,8 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
   const [visibleSignals, setVisibleSignals] = useState<string[]>([]);
   const [signalFilter, setSignalFilter] = useState('');
 
-  const allTraces = simulation?.signals ?? [];
-  const tracesByName = simulation?.signalsByName ?? {};
+  const allTraces = simulation?.signals ?? EMPTY_TRACES;
+  const tracesByName = simulation?.signalsByName ?? EMPTY_TRACE_MAP;
 
   useEffect(() => {
     if (!simulation || simulation.signals.length === 0) {
@@ -374,6 +378,32 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
     setVisibleSignals(cur => cur.includes(name) ? cur.filter(n => n !== name) : [...cur, name]);
   }, []);
 
+  const handleExportJson = useCallback(() => {
+    if (!simulation) return;
+    // BigInts (V4.v / V4.x) need explicit serialization
+    const replacer = (_k: string, v: unknown) =>
+      typeof v === 'bigint' ? v.toString(16) + 'n' : v;
+    const payload = {
+      duration: simulation.duration,
+      timeUnitNs: simulation.timeUnitNs,
+      errors: simulation.errors,
+      logs: simulation.logs,
+      signals: simulation.signals.map(s => ({
+        name: s.name,
+        width: s.width,
+        isMemory: s.isMemory,
+        changes: s.changes.map(c => ({ time: c.time, v: c.value.v.toString(16), x: c.value.x.toString(16) })),
+      })),
+    };
+    const blob = new Blob([JSON.stringify(payload, replacer, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `waveform_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [simulation]);
+
   if (!simulation || simulation.signals.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
@@ -423,6 +453,9 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
         )}
 
         <div className="flex-1" />
+        <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={handleExportJson} title="Download waveform JSON for debugging">
+          <Download className="h-3.5 w-3.5" />
+        </Button>
         <span className="text-[10px] text-muted-foreground">
           {simulation.signals.length} signals · {simulation.duration}ns
         </span>
