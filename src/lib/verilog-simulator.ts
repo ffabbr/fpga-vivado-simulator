@@ -20,7 +20,7 @@
 //   - $display, $write, $monitor (treated as $display), $finish, $time, $readmemh
 //   - module hierarchy with named or positional port connections
 
-import { parseVerilog, type VerilogModule } from './verilog-parser';
+import { parseVerilog, type VerilogInstance, type VerilogModule } from './verilog-parser';
 
 // ============================================================
 // 4-state value model
@@ -161,6 +161,11 @@ function v4Sub(a: V4, b: V4, w: number): V4 {
 function v4Mul(a: V4, b: V4, w: number): V4 {
   if (v4HasX(a, w) || v4HasX(b, w)) return v4X(w);
   return v4FromBig((a.v * b.v) & bmask(w), w);
+}
+function v4Pow(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(w);
+  if (b.v > 1024n) return v4X(w);
+  return v4FromBig((a.v ** b.v) & bmask(w), w);
 }
 function v4Div(a: V4, b: V4, w: number): V4 {
   if (v4HasX(a, w) || v4HasX(b, w) || b.v === 0n) return v4X(w);
@@ -445,6 +450,10 @@ function tokenize(src: string): Tok[] {
     if (/[A-Za-z_$]/.test(c)) {
       let j = i;
       while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      while (src[j] === '.' && /[A-Za-z_$]/.test(src[j + 1] ?? '')) {
+        j++;
+        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      }
       const word = src.slice(i, j);
       const lc = word.toLowerCase();
       const t = KEYWORDS.has(lc) ? lc : (word.startsWith('$') ? 'sysid' : 'id');
@@ -473,8 +482,9 @@ function tokenize(src: string): Tok[] {
 
 class Parser {
   toks: Tok[];
+  params: Map<string, number>;
   i = 0;
-  constructor(toks: Tok[]) { this.toks = toks; }
+  constructor(toks: Tok[], params = new Map<string, number>()) { this.toks = toks; this.params = params; }
 
   peek(off = 0): Tok | undefined { return this.toks[this.i + off]; }
   next(): Tok | undefined { return this.toks[this.i++]; }
@@ -498,7 +508,7 @@ class Parser {
   eof(): boolean { return this.i >= this.toks.length; }
 
   // ────────── Expression precedence (lowest → highest) ──────────
-  // ?:  →  ||  →  &&  →  |  →  ^  →  &  →  ==/!=/===/!==  →  </<=/>/>=  →  <</>>  →  +/-  →  *///%  →  unary
+  // ?:  →  ||  →  &&  →  |  →  ^  →  &  →  ==/!=/===/!==  →  </<=/>/>=  →  <</>>  →  +/-  →  *///%  →  **  →  unary
   parseExpr(): Expr { return this.parseTernary(); }
   parseTernary(): Expr {
     const c = this.parseLogOr();
@@ -570,9 +580,17 @@ class Parser {
     return l;
   }
   parseMul(): Expr {
-    let l = this.parseUnary();
+    let l = this.parsePow();
     while (this.peek()?.type === 'op' && ['*','/','%'].includes(this.peek()!.value)) {
-      const op = this.next()!.value; const r = this.parseUnary(); l = { kind: 'binary', op, l, r };
+      const op = this.next()!.value; const r = this.parsePow(); l = { kind: 'binary', op, l, r };
+    }
+    return l;
+  }
+  parsePow(): Expr {
+    let l = this.parseUnary();
+    if (this.match('op', '**')) {
+      const r = this.parsePow();
+      l = { kind: 'binary', op: '**', l, r };
     }
     return l;
   }
@@ -596,7 +614,7 @@ class Parser {
           // Range part-select; bounds must be compile-time constants per Verilog-2001
           const b = this.parseExpr();
           this.expect('op', ']');
-          const msb = exprConstInt(a), lsb = exprConstInt(b);
+          const msb = exprConstInt(a, this.params), lsb = exprConstInt(b, this.params);
           if (msb !== null && lsb !== null) {
             // Works for plain signals AND for chained accesses like memory[idx][msb:lsb]
             // — evalExpr's 'range' case evaluates the base recursively.
@@ -644,7 +662,7 @@ class Parser {
         const inner = this.parseExpr();
         this.expect('op', '}');
         this.expect('op', '}');
-        const count = exprConstInt(first);
+        const count = exprConstInt(first, this.params);
         if (count === null) throw new Error('Replication count must be constant');
         return { kind: 'replicate', count, inner };
       }
@@ -677,11 +695,16 @@ function exprConstInt(e: Expr, params = new Map<string, number>()): number | nul
       case '+': return l + r;
       case '-': return l - r;
       case '*': return l * r;
+      case '**': return r < 0 ? null : l ** r;
       case '/': return r === 0 ? null : Math.trunc(l / r);
       case '%': return r === 0 ? null : l % r;
       case '<<': return l << r;
       case '>>': return l >> r;
     }
+  }
+  if (e.kind === 'sysfunc' && e.name === '$clog2') {
+    const v = e.args[0] ? exprConstInt(e.args[0], params) : null;
+    return v === null || v <= 0 ? null : Math.ceil(Math.log2(v));
   }
   return null;
 }
@@ -707,6 +730,7 @@ function exprConstNumber(e: Expr, params = new Map<string, number>()): number | 
       case '+': return l + r;
       case '-': return l - r;
       case '*': return l * r;
+      case '**': return r < 0 ? null : l ** r;
       case '/': return r === 0 ? null : l / r;
       case '%': return r === 0 ? null : l % r;
       case '<<': return l << r;
@@ -717,6 +741,10 @@ function exprConstNumber(e: Expr, params = new Map<string, number>()): number | 
     const c = exprConstNumber(e.c, params);
     if (c === null) return null;
     return exprConstNumber(c !== 0 ? e.t : e.f, params);
+  }
+  if (e.kind === 'sysfunc' && e.name === '$clog2') {
+    const v = e.args[0] ? exprConstNumber(e.args[0], params) : null;
+    return v === null || v <= 0 ? null : Math.ceil(Math.log2(v));
   }
   return null;
 }
@@ -803,7 +831,7 @@ function parseDelayValue(p: Parser, params: Map<string, number>, timeUnitNs: num
 
 function parseDelayString(raw: string | undefined, params: Map<string, number>, timeUnitNs: number): number | undefined {
   if (!raw) return undefined;
-  const p = new Parser(tokenize(`#${raw}`));
+  const p = new Parser(tokenize(`#${raw}`), params);
   p.expect('op', '#');
   return parseDelayValue(p, params, timeUnitNs);
 }
@@ -814,11 +842,13 @@ function parseDelayString(raw: string | undefined, params: Map<string, number>, 
 
 function parseStatementsFromString(src: string, params = new Map<string, number>(), timeUnitNs = 1): Stmt[] {
   const toks = tokenize(src);
-  const p = new Parser(toks);
+  const p = new Parser(toks, params);
   const stmts: Stmt[] = [];
   while (!p.eof()) {
+    const before = p.i;
     const s = parseStmt(p, params, timeUnitNs);
     if (s) stmts.push(s);
+    if (p.i === before) p.next();
   }
   return stmts;
 }
@@ -1104,16 +1134,35 @@ interface MemoryDecl { name: string; width: number; depth: number }
 function stripCommentsRaw(src: string): string {
   return src.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
 }
-function findMemories(modSrc: string): MemoryDecl[] {
+function constNumberFromString(src: string, params: Map<string, number>): number | null {
+  try {
+    const expr = new Parser(tokenize(src), params).parseExpr();
+    return exprConstInt(expr, params);
+  } catch {
+    return null;
+  }
+}
+function widthFromRaw(widthRaw: string | undefined, params: Map<string, number>, fallback: number): number {
+  if (!widthRaw) return fallback;
+  const m = widthRaw.match(/\[([^:\]]+):([^\]]+)\]/);
+  if (!m) return fallback;
+  const msb = constNumberFromString(m[1], params);
+  const lsb = constNumberFromString(m[2], params);
+  return msb === null || lsb === null ? fallback : Math.abs(msb - lsb) + 1;
+}
+function findMemories(modSrc: string, params = new Map<string, number>()): MemoryDecl[] {
   const mems: MemoryDecl[] = [];
   const cleaned = stripCommentsRaw(modSrc);
   // reg [W-1:0] name [0:N-1];   or   reg name [0:N-1];
-  const re = /\breg\b\s*(\[(\d+):(\d+)\])?\s*(\w+)\s*\[(\d+)\s*:\s*(\d+)\]\s*;/g;
+  const re = /\b(?:reg|logic)\b\s*(?:signed\s+)?(?:\[([^:\]]+):([^\]]+)\])?\s*(\w+)\s*\[\s*([^:\]]+)\s*:\s*([^\]]+)\]\s*;/g;
   let m;
   while ((m = re.exec(cleaned)) !== null) {
-    const width = m[1] ? Math.abs(parseInt(m[2]) - parseInt(m[3])) + 1 : 1;
-    const a = parseInt(m[5]), b = parseInt(m[6]);
-    mems.push({ name: m[4], width, depth: Math.abs(a - b) + 1 });
+    const msb = m[1] ? constNumberFromString(m[1], params) : 0;
+    const lsb = m[2] ? constNumberFromString(m[2], params) : 0;
+    const a = constNumberFromString(m[4], params);
+    const b = constNumberFromString(m[5], params);
+    if (msb === null || lsb === null || a === null || b === null) continue;
+    mems.push({ name: m[3], width: Math.abs(msb - lsb) + 1, depth: Math.abs(a - b) + 1 });
   }
   return mems;
 }
@@ -1240,6 +1289,7 @@ class SimContext {
   duration = 0;
   timeUnitNs = 1;
   moduleTimeUnitNs = new Map<string, number>();
+  reportedUnsupported = new Set<string>();
 
   resolveSignal(scope: ScopeData, name: string): Signal | undefined {
     return scope.signals.get(name);
@@ -1248,6 +1298,13 @@ class SimContext {
   resolveMemory(scope: ScopeData, name: string): MemoryStore | undefined {
     return scope.memories.get(name);
   }
+}
+
+function reportUnsupported(ctx: SimContext, scope: ScopeData, feature: string): void {
+  const key = `${scope.path}:${feature}`;
+  if (ctx.reportedUnsupported.has(key)) return;
+  ctx.reportedUnsupported.add(key);
+  ctx.errors.push(`Unsupported construct in ${scope.path}: ${feature}`);
 }
 
 function timeUnitForScope(scope: ScopeData, ctx: SimContext): number {
@@ -1262,6 +1319,26 @@ function formatTimeValue(value: number): string {
   return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(12)));
 }
 
+function resolveSignalRead(scope: ScopeData, name: string, ctx: SimContext): Signal | undefined {
+  const local = scope.signals.get(name);
+  if (local) return local;
+  if (!name.includes('.')) return undefined;
+  return ctx.signalsByName.get(name) ?? ctx.signalsByName.get(`${scope.path}.${name}`);
+}
+
+function resolveMemoryRead(scope: ScopeData, name: string, ctx: SimContext): MemoryStore | undefined {
+  const local = scope.memories.get(name);
+  if (local) return local;
+  if (!name.includes('.')) return undefined;
+  const path = ctx.signalsByName.has(name) ? name : `${scope.path}.${name}`;
+  for (const sc of ctx.scopes) {
+    for (const mem of sc.memories.values()) {
+      if (mem.path === name || mem.path === path) return mem;
+    }
+  }
+  return undefined;
+}
+
 // ============================================================
 // Expression evaluator
 // ============================================================
@@ -1270,7 +1347,7 @@ function evalExpr(e: Expr, scope: ScopeData, ctx: SimContext): { val: V4; w: num
   switch (e.kind) {
     case 'num': return { val: e.val, w: e.w };
     case 'id': {
-      const sig = scope.signals.get(e.name);
+      const sig = resolveSignalRead(scope, e.name, ctx);
       if (sig) return { val: sig.value, w: sig.width };
       const param = scope.params.get(e.name);
       if (param !== undefined) return { val: v4FromNum(param, 32), w: 32 };
@@ -1280,7 +1357,7 @@ function evalExpr(e: Expr, scope: ScopeData, ctx: SimContext): { val: V4; w: num
     case 'bit': {
       // base is identifier; check if it's a memory
       if (e.base.kind === 'id') {
-        const mem = scope.memories.get(e.base.name);
+        const mem = resolveMemoryRead(scope, e.base.name, ctx);
         if (mem) {
           const idxR = evalExpr(e.idx, scope, ctx);
           if (v4HasX(idxR.val, idxR.w)) return { val: v4X(mem.width), w: mem.width };
@@ -1345,6 +1422,7 @@ function evalExpr(e: Expr, scope: ScopeData, ctx: SimContext): { val: V4; w: num
         case '+': return { val: v4Add(A, B, w), w };
         case '-': return { val: v4Sub(A, B, w), w };
         case '*': return { val: v4Mul(A, B, w), w };
+        case '**': return { val: v4Pow(A, B, w), w };
         case '/': return { val: v4Div(A, B, w), w };
         case '%': return { val: v4Mod(A, B, w), w };
         case '&': return { val: v4And(A, B, w), w };
@@ -1396,6 +1474,16 @@ function evalExpr(e: Expr, scope: ScopeData, ctx: SimContext): { val: V4; w: num
       if (e.name === '$time' || e.name === '$stime' || e.name === '$realtime') {
         return { val: v4FromBig(BigInt(Math.trunc(currentTimeInUnits(scope, ctx))), 32), w: 32 };
       }
+      if (e.name === '$clog2') {
+        const arg = e.args[0] ? evalExpr(e.args[0], scope, ctx) : { val: v4Zero(), w: 32 };
+        if (v4HasX(arg.val, arg.w) || arg.val.v <= 0n) return { val: v4X(32), w: 32 };
+        return { val: v4FromNum(Math.ceil(Math.log2(Number(arg.val.v))), 32), w: 32 };
+      }
+      if (e.name === '$bits') {
+        const arg = e.args[0] ? evalExpr(e.args[0], scope, ctx) : { val: v4Zero(), w: 0 };
+        return { val: v4FromNum(arg.w, 32), w: 32 };
+      }
+      reportUnsupported(ctx, scope, `system function ${e.name}`);
       return { val: v4Zero(), w: 32 };
     }
   }
@@ -1678,6 +1766,9 @@ function runSysTask(s: Stmt & { kind: 'sys' }, scope: ScopeData, ctx: SimContext
     case '$dumpon':
     case '$dumpoff':
       return;
+    default:
+      reportUnsupported(ctx, scope, `system task ${s.name}`);
+      return;
   }
 }
 
@@ -1856,12 +1947,12 @@ function bindContinuous(target: LValue, expr: Expr, scope: ScopeData, ctx: SimCo
   evalAndWrite();
   // Subscribe — if a sig is later created, this won't pick it up. We bind once.
   for (const sn of reads) {
-    const sig = scope.signals.get(sn);
+    const sig = resolveSignalRead(scope, sn, ctx);
     if (sig) {
       sig.subscribers.add(evalAndWrite);
       continue;
     }
-    const mem = scope.memories.get(sn);
+    const mem = resolveMemoryRead(scope, sn, ctx);
     if (mem) mem.subscribers.add(evalAndWrite);
   }
 }
@@ -1875,8 +1966,8 @@ function collectLValueReads(lv: LValue, out: Set<string>): void {
   }
 }
 
-function gatePrimitiveExpr(gate: string, inputs: string[]): Expr | null {
-  const exprs = inputs.map(input => new Parser(tokenize(input)).parseExpr());
+function gatePrimitiveExpr(gate: string, inputs: string[], params = new Map<string, number>()): Expr | null {
+  const exprs = inputs.map(input => new Parser(tokenize(input), params).parseExpr());
   if (exprs.length === 0) return null;
   const reduce = (op: string) => exprs.slice(1).reduce<Expr>((l, r) => ({ kind: 'binary', op, l, r }), exprs[0]);
   switch (gate) {
@@ -1940,12 +2031,12 @@ function bindAlways(stmts: Stmt[], sens: Sensitivity | 'auto', scope: ScopeData,
   // Initial run
   fire();
   for (const sn of sources) {
-    const sig = scope.signals.get(sn);
+    const sig = resolveSignalRead(scope, sn, ctx);
     if (sig) {
       sig.subscribers.add(fire);
       continue;
     }
-    const mem = scope.memories.get(sn);
+    const mem = resolveMemoryRead(scope, sn, ctx);
     if (mem) mem.subscribers.add(fire);
   }
 }
@@ -1960,23 +2051,49 @@ function elaborate(
   tbName: string,
   ctx: SimContext,
 ): void {
-  const byName = new Map(modules.map(m => [m.name, m]));
+  const byName = new Map<string, VerilogModule>();
+  for (const mod of modules) {
+    if (byName.has(mod.name)) {
+      ctx.errors.push(`Duplicate module definition: ${mod.name}`);
+      continue;
+    }
+    byName.set(mod.name, mod);
+  }
 
-  function makeScope(mod: VerilogModule, path: string): ScopeData {
+  function makeScope(mod: VerilogModule, path: string, inst?: VerilogInstance): ScopeData {
+    const params = new Map(mod.params.map(p => [p.name, p.value]));
+    if (inst?.positionalParameterOverrides) {
+      for (let i = 0; i < inst.positionalParameterOverrides.length && i < mod.params.length; i++) {
+        const value = constNumberFromString(inst.positionalParameterOverrides[i], params);
+        if (value !== null) params.set(mod.params[i].name, value);
+        else ctx.errors.push(`Parameter override in ${path}: ${mod.params[i].name} must be numeric constant`);
+      }
+    }
+    if (inst?.parameterOverrides) {
+      for (const [name, raw] of Object.entries(inst.parameterOverrides)) {
+        if (!params.has(name)) {
+          ctx.errors.push(`Parameter override in ${path}: unknown parameter ${name}`);
+          continue;
+        }
+        const value = constNumberFromString(raw, params);
+        if (value !== null) params.set(name, value);
+        else ctx.errors.push(`Parameter override in ${path}: ${name} must be numeric constant`);
+      }
+    }
     const sc: ScopeData = {
       path,
       signals: new Map(),
       memories: new Map(),
-      params: new Map(mod.params.map(p => [p.name, p.value])),
+      params,
       mod,
     };
     // Allocate signals from ports, wires, regs
     const allDecls: { name: string; width: number }[] = [];
-    for (const p of mod.ports) allDecls.push({ name: p.name, width: p.width });
-    for (const w of mod.wires) allDecls.push({ name: w.name, width: w.width });
-    for (const r of mod.regs) allDecls.push({ name: r.name, width: r.width });
+    for (const p of mod.ports) allDecls.push({ name: p.name, width: widthFromRaw(p.widthRaw, sc.params, p.width) });
+    for (const w of mod.wires) allDecls.push({ name: w.name, width: widthFromRaw(w.widthRaw, sc.params, w.width) });
+    for (const r of mod.regs) allDecls.push({ name: r.name, width: widthFromRaw(r.widthRaw, sc.params, r.width) });
     // Memory declarations
-    const mems = findMemories(mod.raw);
+    const mems = findMemories(mod.raw, sc.params);
     const memNames = new Set(mems.map(m => m.name));
     for (const decl of allDecls) {
       if (memNames.has(decl.name)) continue;
@@ -2008,8 +2125,8 @@ function elaborate(
     // Continuous assigns
     for (const a of mod.assigns) {
       try {
-        const exprAst = new Parser(tokenize(a.expression)).parseExpr();
-        const target = parseLValue(new Parser(tokenize(a.targetRaw ?? a.target)), sc.params);
+        const exprAst = new Parser(tokenize(a.expression), sc.params).parseExpr();
+        const target = parseLValue(new Parser(tokenize(a.targetRaw ?? a.target), sc.params), sc.params);
         if (!target) throw new Error(`invalid assignment target "${a.targetRaw ?? a.target}"`);
         bindContinuous(target, exprAst, sc, ctx, parseDelayString(a.delay, sc.params, timeUnitNs));
       } catch (err) {
@@ -2020,8 +2137,8 @@ function elaborate(
     // Gate primitives
     for (const gp of mod.gatePrimitives) {
       try {
-        const target = parseLValue(new Parser(tokenize(gp.output)), sc.params);
-        const exprAst = gatePrimitiveExpr(gp.gate, gp.inputs);
+        const target = parseLValue(new Parser(tokenize(gp.output), sc.params), sc.params);
+        const exprAst = gatePrimitiveExpr(gp.gate, gp.inputs, sc.params);
         if (target && exprAst) bindContinuous(target, exprAst, sc, ctx, parseDelayString(gp.delay, sc.params, timeUnitNs));
       } catch (err) {
         ctx.errors.push(`gate primitive in ${sc.path}: ${(err as Error).message}`);
@@ -2034,6 +2151,7 @@ function elaborate(
         const stmts = parseStatementsFromString(ib.body, sc.params, timeUnitNs);
         runProcess(() => execBlock(stmts, sc, ctx), sc, ctx, false);
       } catch (err) {
+        if (err instanceof FinishSignal) throw err;
         ctx.errors.push(`initial in ${sc.path}: ${(err as Error).message}`);
       }
     }
@@ -2045,6 +2163,7 @@ function elaborate(
         const sens = parseSensitivityFromString(ab.sensitivity);
         bindAlways(stmts, sens, sc, ctx);
       } catch (err) {
+        if (err instanceof FinishSignal) throw err;
         ctx.errors.push(`always in ${sc.path}: ${(err as Error).message}`);
       }
     }
@@ -2059,16 +2178,21 @@ function elaborate(
         };
         runProcess(make, sc, ctx, /*restartOnFinish=*/true);
       } catch (err) {
+        if (err instanceof FinishSignal) throw err;
         ctx.errors.push(`always in ${sc.path}: ${(err as Error).message}`);
       }
     }
 
     // Submodule instances — recurse
     for (const inst of mod.instances) {
+      if (inst.isArray) {
+        ctx.errors.push(`Unsupported construct in ${sc.path}: instance arrays (${inst.instanceName})`);
+        continue;
+      }
       const sub = byName.get(inst.moduleName);
       if (!sub) continue;
       const subPath = `${sc.path}.${inst.instanceName}`;
-      const subScope = makeScope(sub, subPath);
+      const subScope = makeScope(sub, subPath, inst);
       compileScope(subScope);
       // After child compile, set up bidirectional bindings using a small helper
       bridgeInstance(sc, subScope, inst, sub, ctx);
@@ -2115,7 +2239,7 @@ function parseSensitivityFromString(s: string): Sensitivity {
 function bridgeInstance(
   parent: ScopeData,
   child: ScopeData,
-  inst: { moduleName: string; instanceName: string; connections: Record<string, string>; positionalArgs?: string[] },
+  inst: VerilogInstance,
   childMod: VerilogModule,
   ctx: SimContext,
 ): void {
@@ -2126,7 +2250,7 @@ function bridgeInstance(
     else expr = inst.connections[port.name];
     if (!expr) continue;
     try {
-      const exprAst = new Parser(tokenize(expr)).parseExpr();
+      const exprAst = new Parser(tokenize(expr), parent.params).parseExpr();
       const childPortLv: LValue = { kind: 'id', name: port.name };
       const parentLv = exprToLValue(expr, parent.params);
 
@@ -2155,12 +2279,12 @@ function bindCrossScope(srcScope: ScopeData, dstScope: ScopeData, srcExpr: Expr,
   };
   fire();
   for (const sn of reads) {
-    const sig = srcScope.signals.get(sn);
+    const sig = resolveSignalRead(srcScope, sn, ctx);
     if (sig) {
       sig.subscribers.add(fire);
       continue;
     }
-    const mem = srcScope.memories.get(sn);
+    const mem = resolveMemoryRead(srcScope, sn, ctx);
     if (mem) mem.subscribers.add(fire);
   }
 }
@@ -2168,7 +2292,7 @@ function bindCrossScope(srcScope: ScopeData, dstScope: ScopeData, srcExpr: Expr,
 function exprToLValue(src: string, params = new Map<string, number>()): LValue | null {
   try {
     const toks = tokenize(src);
-    const p = new Parser(toks);
+    const p = new Parser(toks, params);
     return parseLValue(p, params);
   } catch { return null; }
 }
