@@ -1,939 +1,2002 @@
-// Verilog Simulator Engine
-// Simulates synthesizable Verilog at the behavioral level
+// Verilog Simulator — event-driven, 4-state, in-browser.
+//
+// Pipeline:
+//   parseVerilog (verilog-parser.ts)
+//     → elaborate (build module instance tree, allocate signals, resolve port maps)
+//     → compile (parse procedural bodies into statement AST)
+//     → schedule (event-driven generator-based execution with NBA region)
+//     → record (per-signal change list)
+//
+// Coverage: enough Verilog-2005 for typical educational testbenches:
+//   - reg/wire incl. memory arrays
+//   - assign (continuous, comb-sensitive)
+//   - initial / always (explicit list, posedge/negedge, *, no-sensitivity loops)
+//   - blocking and non-blocking assigns; concatenated LHS
+//   - if/else, case, for, repeat, while, begin/end
+//   - intra-statement delays (#N stmt;) and inter-statement delays (#N;)
+//   - bit/range select (LHS and RHS), memory indexing (LHS and RHS)
+//   - 4-state ===, !==, x/z literals (x≡z)
+//   - reduction & unary ops, full binary op set, ternary
+//   - $display, $write, $monitor (treated as $display), $finish, $time, $readmemh
+//   - module hierarchy with named or positional port connections
 
-import { parseVerilog, VerilogModule, VerilogAlwaysBlock } from './verilog-parser';
+import { parseVerilog, type VerilogModule } from './verilog-parser';
 
-export interface SignalValue {
-  value: number;
-  width: number;
+// ============================================================
+// 4-state value model
+// ============================================================
+//
+// A value is { v, x } where each bit i represents the logical bit value:
+//   v=0 x=0 → logic 0
+//   v=1 x=0 → logic 1
+//   any v with x=1 → x (z is collapsed to x for simplicity)
+
+export interface V4 {
+  v: bigint;
+  x: bigint;
 }
 
-export interface WaveformData {
+function bmask(w: number): bigint {
+  return w <= 0 ? 0n : (1n << BigInt(w)) - 1n;
+}
+
+function v4Zero(): V4 { return { v: 0n, x: 0n }; }
+function v4FromBig(n: bigint, w: number): V4 { return { v: n & bmask(w), x: 0n }; }
+function v4FromNum(n: number, w: number): V4 { return v4FromBig(BigInt(n), w); }
+function v4X(w: number): V4 { return { v: 0n, x: bmask(w) }; }
+function v4One(): V4 { return { v: 1n, x: 0n }; }
+
+function v4Eq(a: V4, b: V4, w: number): boolean {
+  const m = bmask(w);
+  return (a.v & m) === (b.v & m) && (a.x & m) === (b.x & m);
+}
+
+function v4HasX(a: V4, w: number): boolean {
+  return (a.x & bmask(w)) !== 0n;
+}
+
+function v4Resize(a: V4, w: number): V4 {
+  const m = bmask(w);
+  return { v: a.v & m, x: a.x & m };
+}
+
+function v4Truthy(a: V4, w: number): boolean {
+  // false iff all bits are 0; x bits are treated as "ambiguous → false" (iverilog matches this)
+  const m = bmask(w);
+  return (a.v & m & ~a.x) !== 0n;
+}
+
+function v4Bit(a: V4, i: number): V4 {
+  const bit = BigInt(i);
+  return { v: (a.v >> bit) & 1n, x: (a.x >> bit) & 1n };
+}
+
+function v4Slice(a: V4, msb: number, lsb: number): V4 {
+  const w = msb - lsb + 1;
+  const sh = BigInt(lsb);
+  return { v: (a.v >> sh) & bmask(w), x: (a.x >> sh) & bmask(w) };
+}
+
+function v4WriteSlice(orig: V4, msb: number, lsb: number, val: V4, fullW: number): V4 {
+  const sw = msb - lsb + 1;
+  const sh = BigInt(lsb);
+  const sm = bmask(sw) << sh;
+  const fm = bmask(fullW);
+  const newV = ((orig.v & ~sm) | ((val.v & bmask(sw)) << sh)) & fm;
+  const newX = ((orig.x & ~sm) | ((val.x & bmask(sw)) << sh)) & fm;
+  return { v: newV, x: newX };
+}
+
+function v4Concat(parts: { val: V4; w: number }[]): { val: V4; w: number } {
+  let v = 0n, x = 0n, w = 0;
+  for (const p of parts) {
+    v = (v << BigInt(p.w)) | (p.val.v & bmask(p.w));
+    x = (x << BigInt(p.w)) | (p.val.x & bmask(p.w));
+    w += p.w;
+  }
+  return { val: { v, x }, w };
+}
+
+// ── bitwise ──────────────────────────────────────────────
+function v4And(a: V4, b: V4, w: number): V4 {
+  const m = bmask(w);
+  const a0 = ~a.v & ~a.x & m;
+  const b0 = ~b.v & ~b.x & m;
+  const def0 = (a0 | b0) & m;
+  const def1 = (a.v & b.v & ~a.x & ~b.x) & m;
+  return { v: def1, x: m & ~def0 & ~def1 };
+}
+function v4Or(a: V4, b: V4, w: number): V4 {
+  const m = bmask(w);
+  const a1 = (a.v & ~a.x) & m;
+  const b1 = (b.v & ~b.x) & m;
+  const def1 = (a1 | b1) & m;
+  const def0 = (~a.v & ~a.x & ~b.v & ~b.x) & m;
+  return { v: def1, x: m & ~def0 & ~def1 };
+}
+function v4Xor(a: V4, b: V4, w: number): V4 {
+  const m = bmask(w);
+  const xm = (a.x | b.x) & m;
+  return { v: (a.v ^ b.v) & m & ~xm, x: xm };
+}
+function v4Not(a: V4, w: number): V4 {
+  const m = bmask(w);
+  return { v: (~a.v) & m & ~a.x, x: a.x & m };
+}
+
+// ── reduction (returns 1 bit) ───────────────────────────
+function v4ReduceAnd(a: V4, w: number): V4 {
+  const m = bmask(w);
+  if ((a.x & m) !== 0n) {
+    // If any 0 bit exists (definitely 0), result is 0; otherwise x
+    if ((~a.v & ~a.x & m) !== 0n) return v4FromBig(0n, 1);
+    return v4X(1);
+  }
+  return ((a.v & m) === m) ? v4One() : v4FromBig(0n, 1);
+}
+function v4ReduceOr(a: V4, w: number): V4 {
+  const m = bmask(w);
+  if (((a.v & ~a.x) & m) !== 0n) return v4One();
+  if ((a.x & m) !== 0n) return v4X(1);
+  return v4FromBig(0n, 1);
+}
+function v4ReduceXor(a: V4, w: number): V4 {
+  const m = bmask(w);
+  if ((a.x & m) !== 0n) return v4X(1);
+  let p = 0n, val = a.v & m;
+  while (val) { p ^= val & 1n; val >>= 1n; }
+  return v4FromBig(p, 1);
+}
+
+// ── arithmetic (x propagates: any x in either → all-x) ──
+function v4Add(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(w);
+  return v4FromBig((a.v + b.v) & bmask(w), w);
+}
+function v4Sub(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(w);
+  const m = bmask(w);
+  return v4FromBig((a.v - b.v) & m, w);
+}
+function v4Mul(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(w);
+  return v4FromBig((a.v * b.v) & bmask(w), w);
+}
+function v4Div(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w) || b.v === 0n) return v4X(w);
+  return v4FromBig(a.v / b.v, w);
+}
+function v4Mod(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w) || b.v === 0n) return v4X(w);
+  return v4FromBig(a.v % b.v, w);
+}
+function v4Shl(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(b, 32)) return v4X(w);
+  return v4FromBig((a.v << b.v) & bmask(w), w);
+}
+function v4Shr(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(b, 32)) return v4X(w);
+  return v4FromBig((a.v & bmask(w)) >> b.v, w);
+}
+
+// ── relational (3-state semantics: x if any x) ───────────
+function v4Lt(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(1);
+  return a.v < b.v ? v4One() : v4FromBig(0n, 1);
+}
+function v4Le(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(1);
+  return a.v <= b.v ? v4One() : v4FromBig(0n, 1);
+}
+function v4Gt(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(1);
+  return a.v > b.v ? v4One() : v4FromBig(0n, 1);
+}
+function v4Ge(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(1);
+  return a.v >= b.v ? v4One() : v4FromBig(0n, 1);
+}
+
+// ── 3-state ==/!=, 4-state ===/!== ──────────────────────
+function v4LogEq(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(1);
+  const m = bmask(w);
+  return (a.v & m) === (b.v & m) ? v4One() : v4FromBig(0n, 1);
+}
+function v4LogNeq(a: V4, b: V4, w: number): V4 {
+  if (v4HasX(a, w) || v4HasX(b, w)) return v4X(1);
+  const m = bmask(w);
+  return (a.v & m) !== (b.v & m) ? v4One() : v4FromBig(0n, 1);
+}
+function v4CaseEq(a: V4, b: V4, w: number): V4 {
+  return v4Eq(a, b, w) ? v4One() : v4FromBig(0n, 1);
+}
+function v4CaseNeq(a: V4, b: V4, w: number): V4 {
+  return v4Eq(a, b, w) ? v4FromBig(0n, 1) : v4One();
+}
+
+// ── format ──────────────────────────────────────────────
+export function v4FormatHex(a: V4, w: number): string {
+  const nib = Math.max(1, Math.ceil(w / 4));
+  if (!v4HasX(a, w)) return (a.v & bmask(w)).toString(16).padStart(nib, '0');
+  const out: string[] = [];
+  for (let i = nib - 1; i >= 0; i--) {
+    const sh = BigInt(i * 4);
+    const xn = (a.x >> sh) & 0xfn;
+    const vn = (a.v >> sh) & 0xfn;
+    out.push(xn !== 0n ? 'x' : vn.toString(16));
+  }
+  return out.join('');
+}
+export function v4FormatBin(a: V4, w: number): string {
+  const out: string[] = [];
+  for (let i = w - 1; i >= 0; i--) {
+    const sh = BigInt(i);
+    const xb = (a.x >> sh) & 1n;
+    const vb = (a.v >> sh) & 1n;
+    out.push(xb !== 0n ? 'x' : (vb !== 0n ? '1' : '0'));
+  }
+  return out.join('');
+}
+export function v4FormatDec(a: V4, w: number): string {
+  if (v4HasX(a, w)) return 'x';
+  return (a.v & bmask(w)).toString(10);
+}
+
+// ============================================================
+// Public output types
+// ============================================================
+
+export interface SignalChange {
   time: number;
-  signals: Record<string, number>;
+  value: V4;
+}
+
+export interface SignalTrace {
+  name: string;       // hierarchical name e.g. "ALU_test.alu.alu_val"
+  width: number;
+  isMemory: false;
+  changes: SignalChange[];
+}
+
+export interface SimulationLog {
+  time: number;
+  message: string;
 }
 
 export interface SimulationResult {
-  waveform: WaveformData[];
-  signals: string[];
-  signalWidths: Record<string, number>;
-  errors: string[];
-  logs: string[];
+  signals: SignalTrace[];
+  signalsByName: Record<string, SignalTrace>;
   duration: number;
+  timeUnitNs: number;
+  errors: string[];
+  logs: SimulationLog[];
+  // Backwards-compat fields (legacy WaveformViewer used these — kept as empty defaults)
+  waveform?: never;
+  signalWidths?: Record<string, number>;
 }
 
-type SignalMap = Record<string, SignalValue>;
+// ============================================================
+// Expression AST
+// ============================================================
 
-class SimulationContext {
-  signals: SignalMap = {};
-  time: number = 0;
-  waveform: WaveformData[] = [];
-  logs: string[] = [];
-  errors: string[] = [];
-  modules: Map<string, VerilogModule> = new Map();
-  maxTime: number = 10000;
-  timeUnit: number = 1;
+type Expr =
+  | { kind: 'num'; w: number; val: V4 }
+  | { kind: 'id'; name: string }
+  | { kind: 'bit'; base: Expr; idx: Expr }
+  | { kind: 'range'; base: Expr; msb: number; lsb: number }
+  | { kind: 'concat'; parts: Expr[] }
+  | { kind: 'replicate'; count: number; inner: Expr }
+  | { kind: 'unary'; op: string; arg: Expr }
+  | { kind: 'binary'; op: string; l: Expr; r: Expr }
+  | { kind: 'ternary'; c: Expr; t: Expr; f: Expr }
+  | { kind: 'sysfunc'; name: string; args: Expr[] };
 
-  constructor(modules: VerilogModule[]) {
-    for (const mod of modules) {
-      this.modules.set(mod.name, mod);
-    }
-  }
+// ============================================================
+// Statement AST
+// ============================================================
 
-  setSignal(name: string, value: number, width: number = 1) {
-    const mask = width >= 32 ? 0xFFFFFFFF : (1 << width) - 1;
-    const maskedValue = value & mask;
-    this.signals[name] = { value: maskedValue, width };
-  }
+type LValue =
+  | { kind: 'id'; name: string }
+  | { kind: 'bit'; name: string; idx: Expr }                    // signal[i]  OR  memory[i]
+  | { kind: 'range'; name: string; msb: number; lsb: number }   // signal[m:l]
+  | { kind: 'memBitSel'; name: string; idx: Expr; bit: Expr }   // mem[i][b]
+  | { kind: 'memRangeSel'; name: string; idx: Expr; msb: number; lsb: number } // mem[i][m:l]
+  | { kind: 'concat'; parts: LValue[] };
 
-  getSignal(name: string): number {
-    return this.signals[name]?.value ?? 0;
-  }
+type Stmt =
+  | { kind: 'block'; body: Stmt[] }
+  | { kind: 'assign'; target: LValue; expr: Expr; nonblocking: boolean }
+  | { kind: 'delay'; ns: number; inner?: Stmt }
+  | { kind: 'eventCtrl'; sens: Sensitivity; inner?: Stmt }
+  | { kind: 'if'; cond: Expr; then: Stmt; else?: Stmt }
+  | { kind: 'case'; sel: Expr; items: { labels: Expr[] | 'default'; body: Stmt }[]; casex: 'case' | 'casex' | 'casez' }
+  | { kind: 'for'; init: Stmt; cond: Expr; step: Stmt; body: Stmt }
+  | { kind: 'while'; cond: Expr; body: Stmt }
+  | { kind: 'repeat'; count: Expr; body: Stmt }
+  | { kind: 'forever'; body: Stmt }
+  | { kind: 'sys'; name: string; args: (Expr | { kind: 'str'; value: string })[] };
 
-  getSignalWidth(name: string): number {
-    return this.signals[name]?.width ?? 1;
-  }
-
-  recordState() {
-    const snapshot: Record<string, number> = {};
-    for (const [name, sv] of Object.entries(this.signals)) {
-      snapshot[name] = sv.value;
-    }
-    this.waveform.push({ time: this.time, signals: snapshot });
-  }
+interface SensEntry { signal: string; edge: 'posedge' | 'negedge' | 'level' }
+interface Sensitivity {
+  any: boolean;             // @(*)
+  list: SensEntry[];
 }
 
-// Find the balanced begin/end block in a string starting at startIdx (pointing to 'begin').
-// Returns the end index (after 'end'), or -1 if unbalanced.
-function findBalancedEnd(src: string, startIdx: number): number {
-  let depth = 0;
-  let i = startIdx;
+// ============================================================
+// Tokenizer (used for both expression and statement parsing)
+// ============================================================
+
+interface Tok { type: string; value: string; pos: number }
+
+const KEYWORDS = new Set([
+  'begin','end','if','else','case','casex','casez','endcase','for','while','repeat','forever',
+  'posedge','negedge','default','assign'
+]);
+
+function tokenize(src: string): Tok[] {
+  const toks: Tok[] = [];
+  let i = 0;
   while (i < src.length) {
-    const rest = src.slice(i);
-    if (rest.match(/^\bbegin\b/)) {
-      depth++;
-      i += 5;
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+    if (c === '/' && src[i + 1] === '/') { while (i < src.length && src[i] !== '\n') i++; continue; }
+    if (c === '/' && src[i + 1] === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i+1] === '/')) i++; i += 2; continue; }
+
+    // Sized number: 32'h1234, 4'bxxxx, 8'd255
+    const sizedM = src.slice(i).match(/^(\d+)?'([sS]?)([bBoOdDhH])([0-9a-fA-FxXzZ_?]+)/);
+    if (sizedM) {
+      toks.push({ type: 'num', value: sizedM[0], pos: i });
+      i += sizedM[0].length;
       continue;
     }
-    if (rest.match(/^\bend\b/)) {
-      depth--;
-      if (depth === 0) return i + 3;
-      i += 3;
+    // Plain integer
+    if (/[0-9]/.test(c)) {
+      let j = i;
+      while (j < src.length && /[0-9_]/.test(src[j])) j++;
+      toks.push({ type: 'num', value: src.slice(i, j), pos: i });
+      i = j;
       continue;
     }
+    // String literal
+    if (c === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') {
+        if (src[j] === '\\') j++;
+        j++;
+      }
+      toks.push({ type: 'str', value: src.slice(i + 1, j), pos: i });
+      i = j + 1;
+      continue;
+    }
+    // Identifier / keyword (including $-system)
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i;
+      while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+      const word = src.slice(i, j);
+      const lc = word.toLowerCase();
+      const t = KEYWORDS.has(lc) ? lc : (word.startsWith('$') ? 'sysid' : 'id');
+      toks.push({ type: t, value: word, pos: i });
+      i = j;
+      continue;
+    }
+    // Multi-char ops
+    const two = src.slice(i, i + 2);
+    const three = src.slice(i, i + 3);
+    if (three === '===' || three === '!==' || three === '<<<' || three === '>>>') {
+      toks.push({ type: 'op', value: three, pos: i }); i += 3; continue;
+    }
+    if (['==','!=','<=','>=','&&','||','<<','>>','**'].includes(two)) {
+      toks.push({ type: 'op', value: two, pos: i }); i += 2; continue;
+    }
+    // Single-char punctuation/op
+    if ('+-*/%&|^~?:<>=(){}[];,@#'.includes(c)) {
+      toks.push({ type: 'op', value: c, pos: i }); i++; continue;
+    }
+    // Unknown — skip
     i++;
   }
-  return -1;
+  return toks;
 }
 
-// Extract the body portion (begin...end block or single statement) from a string.
-// Returns [body, restOfString].
-function extractBody(src: string): [string, string] {
-  const trimmed = src.trimStart();
-  if (trimmed.match(/^\bbegin\b/)) {
-    const offset = src.length - trimmed.length;
-    const endIdx = findBalancedEnd(src, offset);
-    if (endIdx !== -1) {
-      return [src.slice(offset, endIdx), src.slice(endIdx)];
+class Parser {
+  toks: Tok[];
+  i = 0;
+  constructor(toks: Tok[]) { this.toks = toks; }
+
+  peek(off = 0): Tok | undefined { return this.toks[this.i + off]; }
+  next(): Tok | undefined { return this.toks[this.i++]; }
+  check(type: string, value?: string): boolean {
+    const t = this.peek(); if (!t) return false;
+    if (t.type !== type) return false;
+    if (value !== undefined && t.value !== value) return false;
+    return true;
+  }
+  match(type: string, value?: string): boolean {
+    if (this.check(type, value)) { this.i++; return true; }
+    return false;
+  }
+  expect(type: string, value?: string): Tok {
+    const t = this.next();
+    if (!t || t.type !== type || (value !== undefined && t.value !== value)) {
+      throw new Error(`Parse error: expected ${type}${value ? ' "' + value + '"' : ''}, got ${t ? t.type + ' "' + t.value + '"' : 'EOF'} at pos ${t?.pos ?? -1}`);
     }
+    return t;
   }
-  // Single statement ending with ;
-  const semi = src.indexOf(';');
-  if (semi !== -1) {
-    return [src.slice(0, semi + 1).trim(), src.slice(semi + 1)];
+  eof(): boolean { return this.i >= this.toks.length; }
+
+  // ────────── Expression precedence (lowest → highest) ──────────
+  // ?:  →  ||  →  &&  →  |  →  ^  →  &  →  ==/!=/===/!==  →  </<=/>/>=  →  <</>>  →  +/-  →  *///%  →  unary
+  parseExpr(): Expr { return this.parseTernary(); }
+  parseTernary(): Expr {
+    const c = this.parseLogOr();
+    if (this.match('op', '?')) {
+      const t = this.parseExpr();
+      this.expect('op', ':');
+      const f = this.parseExpr();
+      return { kind: 'ternary', c, t, f };
+    }
+    return c;
   }
-  return [src.trim(), ''];
-}
-
-// Expression evaluator for Verilog expressions
-function evaluateExpression(expr: string, ctx: SimulationContext): number {
-  expr = expr.trim();
-
-  // Number literals
-  const numMatch = expr.match(/^(\d+)'([bhd])([0-9a-fA-F_]+)$/);
-  if (numMatch) {
-    const base = numMatch[2] === 'b' ? 2 : numMatch[2] === 'h' ? 16 : 10;
-    return parseInt(numMatch[3].replace(/_/g, ''), base);
+  parseLogOr(): Expr {
+    let l = this.parseLogAnd();
+    while (this.match('op', '||')) { const r = this.parseLogAnd(); l = { kind: 'binary', op: '||', l, r }; }
+    return l;
   }
-
-  // Plain decimal
-  if (/^\d+$/.test(expr)) {
-    return parseInt(expr);
+  parseLogAnd(): Expr {
+    let l = this.parseBitOr();
+    while (this.match('op', '&&')) { const r = this.parseBitOr(); l = { kind: 'binary', op: '&&', l, r }; }
+    return l;
   }
-
-  // Signal reference with bit select
-  const bitSelectMatch = expr.match(/^(\w+)\[(\d+)\]$/);
-  if (bitSelectMatch) {
-    const val = ctx.getSignal(bitSelectMatch[1]);
-    const bit = parseInt(bitSelectMatch[2]);
-    return (val >> bit) & 1;
+  parseBitOr(): Expr {
+    let l = this.parseBitXor();
+    while (this.peek()?.type === 'op' && this.peek()?.value === '|' && this.peek(1)?.value !== '|') {
+      this.next(); const r = this.parseBitXor(); l = { kind: 'binary', op: '|', l, r };
+    }
+    return l;
   }
-
-  // Signal reference with range select
-  const rangeSelectMatch = expr.match(/^(\w+)\[(\d+):(\d+)\]$/);
-  if (rangeSelectMatch) {
-    const val = ctx.getSignal(rangeSelectMatch[1]);
-    const msb = parseInt(rangeSelectMatch[2]);
-    const lsb = parseInt(rangeSelectMatch[3]);
-    const width = msb - lsb + 1;
-    const mask = (1 << width) - 1;
-    return (val >> lsb) & mask;
+  parseBitXor(): Expr {
+    let l = this.parseBitAnd();
+    while (this.peek()?.type === 'op' && (this.peek()?.value === '^')) {
+      this.next(); const r = this.parseBitAnd(); l = { kind: 'binary', op: '^', l, r };
+    }
+    return l;
   }
-
-  // Simple signal reference
-  if (/^\w+$/.test(expr)) {
-    return ctx.getSignal(expr);
+  parseBitAnd(): Expr {
+    let l = this.parseEq();
+    while (this.peek()?.type === 'op' && this.peek()?.value === '&' && this.peek(1)?.value !== '&') {
+      this.next(); const r = this.parseEq(); l = { kind: 'binary', op: '&', l, r };
+    }
+    return l;
   }
-
-  // Concatenation {a, b, c}
-  const concatMatch = expr.match(/^\{(.+)\}$/);
-  if (concatMatch) {
-    const parts = splitTopLevel(concatMatch[1], ',');
-    let result = 0;
-    let totalBits = 0;
-    for (const part of parts) {
-      const trimmed = part.trim();
-      // Check for replication {N{expr}}
-      const repMatch = trimmed.match(/^(\d+)\{(.+)\}$/);
-      if (repMatch) {
-        const count = parseInt(repMatch[1]);
-        const innerVal = evaluateExpression(repMatch[2], ctx);
-        const innerWidth = guessWidth(repMatch[2], ctx);
-        for (let i = 0; i < count; i++) {
-          result = (result << innerWidth) | innerVal;
-          totalBits += innerWidth;
+  parseEq(): Expr {
+    let l = this.parseRel();
+    while (this.peek()?.type === 'op' && ['==','!=','===','!=='].includes(this.peek()!.value)) {
+      const op = this.next()!.value; const r = this.parseRel(); l = { kind: 'binary', op, l, r };
+    }
+    return l;
+  }
+  parseRel(): Expr {
+    let l = this.parseShift();
+    while (this.peek()?.type === 'op' && ['<','<=','>','>='].includes(this.peek()!.value)) {
+      const op = this.next()!.value; const r = this.parseShift(); l = { kind: 'binary', op, l, r };
+    }
+    return l;
+  }
+  parseShift(): Expr {
+    let l = this.parseAdd();
+    while (this.peek()?.type === 'op' && ['<<','>>','<<<','>>>'].includes(this.peek()!.value)) {
+      const op = this.next()!.value; const r = this.parseAdd(); l = { kind: 'binary', op, l, r };
+    }
+    return l;
+  }
+  parseAdd(): Expr {
+    let l = this.parseMul();
+    while (this.peek()?.type === 'op' && ['+','-'].includes(this.peek()!.value)) {
+      const op = this.next()!.value; const r = this.parseMul(); l = { kind: 'binary', op, l, r };
+    }
+    return l;
+  }
+  parseMul(): Expr {
+    let l = this.parseUnary();
+    while (this.peek()?.type === 'op' && ['*','/','%'].includes(this.peek()!.value)) {
+      const op = this.next()!.value; const r = this.parseUnary(); l = { kind: 'binary', op, l, r };
+    }
+    return l;
+  }
+  parseUnary(): Expr {
+    const t = this.peek();
+    if (t?.type === 'op' && ['!','~','-','+','&','|','^','~&','~|','~^'].includes(t.value)) {
+      // Disambiguate unary &/|/^ from binary by context (this is called after operator → must be unary)
+      this.next();
+      const arg = this.parseUnary();
+      return { kind: 'unary', op: t.value, arg };
+    }
+    return this.parsePostfix();
+  }
+  parsePostfix(): Expr {
+    let e = this.parsePrim();
+    while (true) {
+      if (this.check('op', '[')) {
+        this.next();
+        const a = this.parseExpr();
+        if (this.match('op', ':')) {
+          // Range — must be constant for now (matches Verilog reg part-select in expressions)
+          const b = this.parseExpr();
+          this.expect('op', ']');
+          const msb = exprConstInt(a), lsb = exprConstInt(b);
+          if (msb !== null && lsb !== null && e.kind === 'id') {
+            e = { kind: 'range', base: e, msb, lsb };
+          } else {
+            // Conservative fallback: bit-select msb (rare in real code)
+            e = { kind: 'bit', base: e, idx: a };
+          }
+        } else {
+          this.expect('op', ']');
+          e = { kind: 'bit', base: e, idx: a };
         }
-      } else {
-        const val = evaluateExpression(trimmed, ctx);
-        const w = guessWidth(trimmed, ctx);
-        result = (result << w) | val;
-        totalBits += w;
+      } else break;
+    }
+    return e;
+  }
+  parsePrim(): Expr {
+    const t = this.next();
+    if (!t) throw new Error('Unexpected end of expression');
+    if (t.type === 'num') return { kind: 'num', ...parseNumberLit(t.value) };
+    if (t.type === 'id') return { kind: 'id', name: t.value };
+    if (t.type === 'sysid') {
+      // System function call — only $time and similar take no args here
+      if (this.match('op', '(')) {
+        const args: Expr[] = [];
+        if (!this.check('op', ')')) {
+          args.push(this.parseExpr());
+          while (this.match('op', ',')) args.push(this.parseExpr());
+        }
+        this.expect('op', ')');
+        return { kind: 'sysfunc', name: t.value, args };
       }
+      return { kind: 'sysfunc', name: t.value, args: [] };
     }
-    return result;
-  }
-
-  // Unary operators
-  if (expr.startsWith('~')) {
-    const operand = evaluateExpression(expr.slice(1), ctx);
-    return ~operand;
-  }
-  if (expr.startsWith('!')) {
-    const operand = evaluateExpression(expr.slice(1), ctx);
-    return operand === 0 ? 1 : 0;
-  }
-  if (expr.startsWith('&')) {
-    // Reduction AND
-    const operand = evaluateExpression(expr.slice(1), ctx);
-    const w = guessWidth(expr.slice(1), ctx);
-    const mask = (1 << w) - 1;
-    return (operand & mask) === mask ? 1 : 0;
-  }
-  if (expr.startsWith('|')) {
-    const operand = evaluateExpression(expr.slice(1), ctx);
-    return operand !== 0 ? 1 : 0;
-  }
-  if (expr.startsWith('^')) {
-    // Reduction XOR
-    const operand = evaluateExpression(expr.slice(1), ctx);
-    let result = 0;
-    let val = operand;
-    while (val) { result ^= val & 1; val >>= 1; }
-    return result;
-  }
-
-  // Ternary operator
-  const ternaryParts = splitTernary(expr);
-  if (ternaryParts) {
-    const cond = evaluateExpression(ternaryParts.condition, ctx);
-    return cond ? evaluateExpression(ternaryParts.trueExpr, ctx) :
-      evaluateExpression(ternaryParts.falseExpr, ctx);
-  }
-
-  // Binary operators (ordered by precedence, lowest first)
-  const binaryOps: [string, (a: number, b: number) => number][] = [
-    ['||', (a, b) => (a || b) ? 1 : 0],
-    ['&&', (a, b) => (a && b) ? 1 : 0],
-    ['|', (a, b) => a | b],
-    ['^', (a, b) => a ^ b],
-    ['&', (a, b) => a & b],
-    ['==', (a, b) => a === b ? 1 : 0],
-    ['!=', (a, b) => a !== b ? 1 : 0],
-    ['>=', (a, b) => a >= b ? 1 : 0],
-    ['<=', (a, b) => a <= b ? 1 : 0],
-    ['>', (a, b) => a > b ? 1 : 0],
-    ['<', (a, b) => a < b ? 1 : 0],
-    ['<<', (a, b) => a << b],
-    ['>>', (a, b) => a >>> b],
-    ['+', (a, b) => a + b],
-    ['-', (a, b) => a - b],
-    ['*', (a, b) => a * b],
-    ['/', (a, b) => b !== 0 ? Math.floor(a / b) : 0],
-    ['%', (a, b) => b !== 0 ? a % b : 0],
-  ];
-
-  for (const [op, fn] of binaryOps) {
-    const idx = findBinaryOp(expr, op);
-    if (idx >= 0) {
-      const left = evaluateExpression(expr.slice(0, idx), ctx);
-      const right = evaluateExpression(expr.slice(idx + op.length), ctx);
-      return fn(left, right);
+    if (t.type === 'op' && t.value === '(') {
+      const e = this.parseExpr();
+      this.expect('op', ')');
+      return e;
     }
-  }
-
-  // Parenthesized expression
-  if (expr.startsWith('(') && expr.endsWith(')')) {
-    return evaluateExpression(expr.slice(1, -1), ctx);
-  }
-
-  return 0;
-}
-
-function guessWidth(expr: string, ctx: SimulationContext): number {
-  expr = expr.trim();
-  const numMatch = expr.match(/^(\d+)'[bhd]/);
-  if (numMatch) return parseInt(numMatch[1]);
-  if (/^\d+$/.test(expr)) return 32;
-  const bitSelectMatch = expr.match(/^(\w+)\[(\d+)\]$/);
-  if (bitSelectMatch) return 1;
-  const rangeSelectMatch = expr.match(/^(\w+)\[(\d+):(\d+)\]$/);
-  if (rangeSelectMatch) return parseInt(rangeSelectMatch[2]) - parseInt(rangeSelectMatch[3]) + 1;
-  if (/^\w+$/.test(expr)) return ctx.getSignalWidth(expr);
-  return 1;
-}
-
-function findBinaryOp(expr: string, op: string): number {
-  let depth = 0;
-  // Search from right to left for left-associative operators
-  for (let i = expr.length - 1; i >= op.length; i--) {
-    if (expr[i] === ')' || expr[i] === '}') depth++;
-    if (expr[i] === '(' || expr[i] === '{') depth--;
-    if (depth === 0) {
-      const slice = expr.slice(i - op.length + 1, i + 1);
-      if (slice === op) {
-        // Make sure we're not matching a multi-char operator partially
-        if (op === '|' && (expr[i - 1] === '|' || expr[i + 1] === '|')) continue;
-        if (op === '&' && (expr[i - 1] === '&' || expr[i + 1] === '&')) continue;
-        if (op === '>' && expr[i - 1] === '>') continue;
-        if (op === '<' && expr[i - 1] === '<') continue;
-        if (op === '=' && (expr[i - 1] === '=' || expr[i - 1] === '!' || expr[i - 1] === '>' || expr[i - 1] === '<')) continue;
-        const leftPart = expr.slice(0, i - op.length + 1).trim();
-        if (leftPart.length === 0) continue;
-        return i - op.length + 1;
+    if (t.type === 'op' && t.value === '{') {
+      // Concatenation or replication
+      const first = this.parseExpr();
+      if (this.match('op', '{')) {
+        // Replication: {N{expr}}
+        const inner = this.parseExpr();
+        this.expect('op', '}');
+        this.expect('op', '}');
+        const count = exprConstInt(first);
+        if (count === null) throw new Error('Replication count must be constant');
+        return { kind: 'replicate', count, inner };
       }
+      const parts: Expr[] = [first];
+      while (this.match('op', ',')) parts.push(this.parseExpr());
+      this.expect('op', '}');
+      return { kind: 'concat', parts };
     }
+    throw new Error(`Unexpected token "${t.value}" at pos ${t.pos}`);
   }
-  return -1;
 }
 
-function splitTopLevel(str: string, delimiter: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let current = '';
-  for (const ch of str) {
-    if (ch === '(' || ch === '{') depth++;
-    if (ch === ')' || ch === '}') depth--;
-    if (ch === delimiter && depth === 0) {
-      parts.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
+function exprConstInt(e: Expr): number | null {
+  if (e.kind === 'num') {
+    if ((e.val.x & bmask(e.w)) !== 0n) return null;
+    return Number(e.val.v);
   }
-  if (current.trim()) parts.push(current);
-  return parts;
-}
-
-function splitTernary(expr: string): { condition: string; trueExpr: string; falseExpr: string } | null {
-  let depth = 0;
-  let questionIdx = -1;
-  for (let i = 0; i < expr.length; i++) {
-    if (expr[i] === '(' || expr[i] === '{') depth++;
-    if (expr[i] === ')' || expr[i] === '}') depth--;
-    if (depth === 0 && expr[i] === '?') {
-      questionIdx = i;
-      break;
-    }
-  }
-  if (questionIdx < 0) return null;
-
-  depth = 0;
-  for (let i = questionIdx + 1; i < expr.length; i++) {
-    if (expr[i] === '(' || expr[i] === '{') depth++;
-    if (expr[i] === ')' || expr[i] === '}') depth--;
-    if (depth === 0 && expr[i] === ':') {
-      return {
-        condition: expr.slice(0, questionIdx).trim(),
-        trueExpr: expr.slice(questionIdx + 1, i).trim(),
-        falseExpr: expr.slice(i + 1).trim(),
-      };
-    }
+  if (e.kind === 'unary' && e.op === '-') {
+    const v = exprConstInt(e.arg); return v === null ? null : -v;
   }
   return null;
 }
 
-// Execute a block of procedural Verilog statements
-function executeBlock(code: string, ctx: SimulationContext): void {
-  let body = code.trim();
-  if (body.startsWith('begin')) body = body.slice(5);
-  if (body.endsWith('end')) body = body.slice(0, -3);
-  body = body.trim();
-
-  const statements = parseStatements(body);
-  for (const stmt of statements) {
-    executeStatement(stmt.trim(), ctx);
+function parseNumberLit(s: string): { w: number; val: V4 } {
+  // sized: 32'h1234, 4'bxxxx, 100'h00...
+  const m = s.match(/^(\d+)?'([sS]?)([bBoOdDhH])([0-9a-fA-FxXzZ_?]+)$/);
+  if (m) {
+    const w = m[1] ? parseInt(m[1]) : 32;
+    const base = m[3].toLowerCase();
+    const digits = m[4].replace(/_/g, '');
+    let v = 0n, x = 0n;
+    const radix = base === 'b' ? 1 : base === 'o' ? 3 : base === 'h' ? 4 : 0;
+    if (radix > 0) {
+      for (const ch of digits) {
+        const c = ch.toLowerCase();
+        v <<= BigInt(radix); x <<= BigInt(radix);
+        if (c === 'x' || c === '?' || c === 'z') {
+          x |= bmask(radix);
+        } else {
+          v |= BigInt(parseInt(c, base === 'b' ? 2 : base === 'o' ? 8 : 16));
+        }
+      }
+    } else {
+      // decimal
+      v = BigInt(parseInt(digits, 10));
+    }
+    return { w, val: { v: v & bmask(w), x: x & bmask(w) } };
   }
+  // plain decimal
+  const n = parseInt(s.replace(/_/g, ''), 10);
+  return { w: 32, val: { v: BigInt(n) & bmask(32), x: 0n } };
 }
 
-function parseStatements(body: string): string[] {
-  const statements: string[] = [];
-  let current = '';
-  let depth = 0;
-  let inCase = 0;
+// ============================================================
+// Statement parser
+// ============================================================
 
-  const lines = body.split('\n');
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-
-    // Track begin/end depth for multi-line blocks
-    const beginCount = (line.match(/\bbegin\b/g) || []).length;
-    const endCount = (line.match(/\bend\b/g) || []).length;
-    const caseCount = (line.match(/\bcase[zx]?\b/g) || []).length;
-    const endcaseCount = (line.match(/\bendcase\b/g) || []).length;
-
-    depth += beginCount - endCount;
-    inCase += caseCount - endcaseCount;
-
-    current += (current ? '\n' : '') + line;
-
-    if (depth <= 0 && inCase <= 0) {
-      if (line.endsWith(';') || line === 'end' || line === 'endcase') {
-        statements.push(current);
-        current = '';
-        depth = 0;
-        inCase = 0;
-      }
-    }
+function parseStatementsFromString(src: string): Stmt[] {
+  const toks = tokenize(src);
+  const p = new Parser(toks);
+  const stmts: Stmt[] = [];
+  while (!p.eof()) {
+    const s = parseStmt(p);
+    if (s) stmts.push(s);
   }
-  if (current.trim()) statements.push(current);
-  return statements;
+  return stmts;
 }
 
-function executeStatement(stmt: string, ctx: SimulationContext): void {
-  stmt = stmt.trim();
-  if (!stmt || stmt === 'begin' || stmt === 'end') return;
+function parseStmt(p: Parser): Stmt | null {
+  const t = p.peek();
+  if (!t) return null;
 
-  // $display / $monitor
-  const displayMatch = stmt.match(/\$(display|monitor)\s*\(\s*"([^"]*)"(?:\s*,\s*(.+))?\)\s*;/);
-  if (displayMatch) {
-    let fmt = displayMatch[2];
-    if (displayMatch[3]) {
-      const args = splitTopLevel(displayMatch[3], ',');
-      for (const arg of args) {
-        const val = evaluateExpression(arg.trim(), ctx);
-        fmt = fmt.replace(/%[bdh0-9]*/, val.toString());
-      }
+  // Skip stray semicolons
+  if (t.type === 'op' && t.value === ';') { p.next(); return null; }
+
+  if (t.type === 'begin') {
+    p.next();
+    const body: Stmt[] = [];
+    while (!p.eof() && !p.check('end')) {
+      const s = parseStmt(p); if (s) body.push(s);
     }
-    fmt = fmt.replace(/%t/, ctx.time.toString());
-    ctx.logs.push(`[${ctx.time}] ${fmt}`);
-    return;
+    p.expect('end');
+    return { kind: 'block', body };
   }
 
-  // $finish
-  if (stmt.match(/\$finish\s*;/)) {
-    ctx.time = ctx.maxTime; // End simulation
-    return;
-  }
-
-  // Time delay #N
-  const delayMatch = stmt.match(/^#(\d+)\s*;?$/);
-  if (delayMatch) {
-    ctx.time += parseInt(delayMatch[1]) * ctx.timeUnit;
-    ctx.recordState();
-    return;
-  }
-
-  // Delay followed by statement: #N statement;
-  const delayStmtMatch = stmt.match(/^#(\d+)\s+(.+)$/);
-  if (delayStmtMatch) {
-    ctx.time += parseInt(delayStmtMatch[1]) * ctx.timeUnit;
-    ctx.recordState();
-    executeStatement(delayStmtMatch[2], ctx);
-    return;
-  }
-
-  // Non-blocking assignment: signal <= expr;
-  const nbaMatch = stmt.match(/^(\w+)(\[\d+(?::\d+)?\])?\s*<=\s*(.+?)\s*;$/);
-  if (nbaMatch) {
-    const val = evaluateExpression(nbaMatch[3], ctx);
-    const width = ctx.getSignalWidth(nbaMatch[1]) || guessWidth(nbaMatch[3], ctx);
-    if (nbaMatch[2]) {
-      handleBitAssign(nbaMatch[1], nbaMatch[2], val, ctx);
-    } else {
-      ctx.setSignal(nbaMatch[1], val, width);
+  if (t.type === 'if') {
+    p.next();
+    p.expect('op', '(');
+    const cond = p.parseExpr();
+    p.expect('op', ')');
+    const thenS = parseStmt(p) ?? { kind: 'block', body: [] };
+    let elseS: Stmt | undefined;
+    if (p.check('else')) {
+      p.next();
+      elseS = parseStmt(p) ?? { kind: 'block', body: [] };
     }
-    return;
+    return { kind: 'if', cond, then: thenS, else: elseS };
   }
 
-  // Blocking assignment: signal = expr;
-  const baMatch = stmt.match(/^(\w+)(\[\d+(?::\d+)?\])?\s*=\s*(.+?)\s*;$/);
-  if (baMatch) {
-    const val = evaluateExpression(baMatch[3], ctx);
-    const width = ctx.getSignalWidth(baMatch[1]) || guessWidth(baMatch[3], ctx);
-    if (baMatch[2]) {
-      handleBitAssign(baMatch[1], baMatch[2], val, ctx);
-    } else {
-      ctx.setSignal(baMatch[1], val, width);
-    }
-    return;
-  }
-
-  // if-else
-  const ifHeaderMatch = stmt.match(/^if\s*\((.+?)\)\s*/);
-  if (ifHeaderMatch) {
-    const cond = evaluateExpression(ifHeaderMatch[1], ctx);
-    const afterCond = stmt.slice(ifHeaderMatch[0].length);
-    const [ifBody, afterIfBody] = extractBody(afterCond);
-    const elseMatch = afterIfBody.match(/^\s*else\s*/);
-    if (cond) {
-      executeBlock(ifBody, ctx);
-    } else if (elseMatch) {
-      const afterElse = afterIfBody.slice(elseMatch[0].length);
-      const [elseBody] = extractBody(afterElse);
-      executeBlock(elseBody, ctx);
-    }
-    return;
-  }
-
-  // case statement
-  const caseMatch = stmt.match(/^case[zx]?\s*\((.+?)\)\s*([\s\S]*?)\s*endcase/);
-  if (caseMatch) {
-    const caseVal = evaluateExpression(caseMatch[1], ctx);
-    const caseBody = caseMatch[2];
-    const caseItems = caseBody.split(/\n/).reduce((acc: string[], line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed) return acc;
-      if (acc.length > 0 && !trimmed.match(/^(\d+[']|default\s*:|\w+\s*:)/)) {
-        acc[acc.length - 1] += '\n' + trimmed;
+  if (t.type === 'case' || t.type === 'casex' || t.type === 'casez') {
+    const which = t.type as 'case' | 'casex' | 'casez';
+    p.next();
+    p.expect('op', '(');
+    const sel = p.parseExpr();
+    p.expect('op', ')');
+    const items: { labels: Expr[] | 'default'; body: Stmt }[] = [];
+    while (!p.eof() && !p.check('id', 'endcase') && p.peek()?.value !== 'endcase') {
+      if (p.check('default')) {
+        p.next(); p.match('op', ':');
+        const body = parseStmt(p) ?? { kind: 'block', body: [] };
+        items.push({ labels: 'default', body });
       } else {
-        acc.push(trimmed);
-      }
-      return acc;
-    }, []);
-
-    let matched = false;
-    for (const item of caseItems) {
-      const itemMatch = item.match(/^(.+?)\s*:\s*([\s\S]+)$/);
-      if (!itemMatch) continue;
-      const label = itemMatch[1].trim();
-      const action = itemMatch[2].trim();
-
-      if (label === 'default') {
-        if (!matched) executeBlock(action, ctx);
-        break;
-      }
-
-      const labelVal = evaluateExpression(label, ctx);
-      if (labelVal === caseVal && !matched) {
-        matched = true;
-        executeBlock(action, ctx);
+        const labels: Expr[] = [p.parseExpr()];
+        while (p.match('op', ',')) labels.push(p.parseExpr());
+        p.expect('op', ':');
+        const body = parseStmt(p) ?? { kind: 'block', body: [] };
+        items.push({ labels, body });
       }
     }
-    return;
+    // 'endcase' is a keyword we tokenize as id
+    if (p.peek()?.value === 'endcase') p.next();
+    return { kind: 'case', sel, items, casex: which };
   }
 
-  // for loop
-  const forMatch = stmt.match(/^for\s*\((.+?);(.+?);(.+?)\)\s*/);
-  if (forMatch) {
-    const afterForHeader = stmt.slice(forMatch[0].length);
-    const [forBody] = extractBody(afterForHeader);
-    executeStatement(forMatch[1].trim() + ';', ctx);
-    let iterations = 0;
-    while (evaluateExpression(forMatch[2].trim(), ctx) && iterations < 10000) {
-      executeBlock(forBody, ctx);
-      executeStatement(forMatch[3].trim() + ';', ctx);
-      iterations++;
+  if (t.type === 'for') {
+    p.next();
+    p.expect('op', '(');
+    const init = parseSimpleStmt(p);
+    p.match('op', ';');
+    const cond = p.parseExpr();
+    p.expect('op', ';');
+    const step = parseSimpleStmt(p);
+    p.expect('op', ')');
+    const body = parseStmt(p) ?? { kind: 'block', body: [] };
+    return { kind: 'for', init: init ?? { kind: 'block', body: [] }, cond, step: step ?? { kind: 'block', body: [] }, body };
+  }
+
+  if (t.type === 'while') {
+    p.next();
+    p.expect('op', '(');
+    const cond = p.parseExpr();
+    p.expect('op', ')');
+    const body = parseStmt(p) ?? { kind: 'block', body: [] };
+    return { kind: 'while', cond, body };
+  }
+
+  if (t.type === 'repeat') {
+    p.next();
+    p.expect('op', '(');
+    const count = p.parseExpr();
+    p.expect('op', ')');
+    const body = parseStmt(p) ?? { kind: 'block', body: [] };
+    return { kind: 'repeat', count, body };
+  }
+
+  if (t.type === 'forever') {
+    p.next();
+    const body = parseStmt(p) ?? { kind: 'block', body: [] };
+    return { kind: 'forever', body };
+  }
+
+  if (t.type === 'op' && t.value === '#') {
+    p.next();
+    const numTok = p.expect('num');
+    const ns = parseInt(numTok.value, 10);
+    if (p.match('op', ';')) return { kind: 'delay', ns };
+    const inner = parseStmt(p) ?? undefined;
+    return { kind: 'delay', ns, inner };
+  }
+
+  if (t.type === 'op' && t.value === '@') {
+    p.next();
+    const sens = parseSensitivity(p);
+    if (p.match('op', ';')) return { kind: 'eventCtrl', sens };
+    const inner = parseStmt(p) ?? undefined;
+    return { kind: 'eventCtrl', sens, inner };
+  }
+
+  if (t.type === 'sysid') {
+    p.next();
+    const args: (Expr | { kind: 'str'; value: string })[] = [];
+    if (p.match('op', '(')) {
+      if (!p.check('op', ')')) {
+        do {
+          if (p.check('str')) { args.push({ kind: 'str', value: p.next()!.value }); }
+          else args.push(p.parseExpr());
+        } while (p.match('op', ','));
+      }
+      p.expect('op', ')');
     }
-    return;
+    p.match('op', ';');
+    return { kind: 'sys', name: t.value, args };
   }
 
-  // repeat
-  const repeatMatch = stmt.match(/^repeat\s*\((.+?)\)\s*/);
-  if (repeatMatch) {
-    const afterRepeat = stmt.slice(repeatMatch[0].length);
-    const [repeatBody] = extractBody(afterRepeat);
-    const count = evaluateExpression(repeatMatch[1], ctx);
-    for (let i = 0; i < count && i < 100000; i++) {
-      executeBlock(repeatBody, ctx);
-    }
-    return;
-  }
-
-  // $dumpfile, $dumpvars - ignore
-  if (stmt.startsWith('$dump')) return;
-  // $monitor - ignore for now
-  if (stmt.startsWith('$monitor')) return;
+  // Statement starting with identifier → assignment
+  return parseAssignStmt(p);
 }
 
-function handleBitAssign(name: string, selector: string, val: number, ctx: SimulationContext) {
-  const current = ctx.getSignal(name);
-  const width = ctx.getSignalWidth(name);
-  const bitMatch = selector.match(/\[(\d+)(?::(\d+))?\]/);
-  if (!bitMatch) return;
+function parseSimpleStmt(p: Parser): Stmt | null {
+  // Used inside for(...) — disallows trailing ';'
+  const t = p.peek();
+  if (!t) return null;
+  if (t.type === 'op' && t.value === ';') return null;
+  return parseAssignStmt(p, /*requireSemi=*/false);
+}
 
-  if (bitMatch[2] !== undefined) {
-    const msb = parseInt(bitMatch[1]);
-    const lsb = parseInt(bitMatch[2]);
-    const rangeWidth = msb - lsb + 1;
-    const mask = ((1 << rangeWidth) - 1) << lsb;
-    const newVal = (current & ~mask) | ((val << lsb) & mask);
-    ctx.setSignal(name, newVal, width);
-  } else {
-    const bit = parseInt(bitMatch[1]);
-    const mask = 1 << bit;
-    const newVal = val ? (current | mask) : (current & ~mask);
-    ctx.setSignal(name, newVal, width);
+function parseAssignStmt(p: Parser, requireSemi = true): Stmt | null {
+  const lhs = parseLValue(p);
+  if (!lhs) return null;
+  const opTok = p.peek();
+  if (!opTok) return null;
+  let nonblocking = false;
+  if (opTok.type === 'op' && opTok.value === '<=') { p.next(); nonblocking = true; }
+  else if (opTok.type === 'op' && opTok.value === '=') { p.next(); }
+  else {
+    // Bare expression-statement-like? Not valid in Verilog procedural — skip token.
+    return null;
+  }
+
+  // intra-assignment delay: signal = #5 expr;
+  if (p.match('op', '#')) {
+    p.expect('num'); // ignored — we collapse with following delay equivalent
+  }
+
+  const expr = p.parseExpr();
+  if (requireSemi) p.match('op', ';');
+  return { kind: 'assign', target: lhs, expr, nonblocking };
+}
+
+function parseLValue(p: Parser): LValue | null {
+  if (p.check('op', '{')) {
+    p.next();
+    const parts: LValue[] = [];
+    parts.push(parseLValue(p)!);
+    while (p.match('op', ',')) parts.push(parseLValue(p)!);
+    p.expect('op', '}');
+    return { kind: 'concat', parts };
+  }
+  if (!p.check('id')) return null;
+  const name = p.next()!.value;
+  if (p.match('op', '[')) {
+    const a = p.parseExpr();
+    if (p.match('op', ':')) {
+      const b = p.parseExpr();
+      p.expect('op', ']');
+      const msb = exprConstInt(a), lsb = exprConstInt(b);
+      if (msb === null || lsb === null) {
+        // Variable range — uncommon — treat as bit-sel msb
+        return { kind: 'bit', name, idx: a };
+      }
+      return { kind: 'range', name, msb, lsb };
+    }
+    p.expect('op', ']');
+    // Could be memory[idx] or signal[bit]; we resolve at execution time using ctx info
+    // BUT memory[i][bit] / memory[i][m:l] needs additional brackets
+    if (p.match('op', '[')) {
+      const b1 = p.parseExpr();
+      if (p.match('op', ':')) {
+        const b2 = p.parseExpr();
+        p.expect('op', ']');
+        const msb = exprConstInt(b1), lsb = exprConstInt(b2);
+        if (msb === null || lsb === null) return { kind: 'bit', name, idx: a };
+        return { kind: 'memRangeSel', name, idx: a, msb, lsb };
+      }
+      p.expect('op', ']');
+      return { kind: 'memBitSel', name, idx: a, bit: b1 };
+    }
+    return { kind: 'bit', name, idx: a };
+  }
+  return { kind: 'id', name };
+}
+
+function parseSensitivity(p: Parser): Sensitivity {
+  if (!p.match('op', '(')) {
+    // @* form: @(*) but written as @* maybe
+    if (p.match('op', '*')) return { any: true, list: [] };
+    return { any: false, list: [] };
+  }
+  if (p.match('op', '*')) {
+    p.expect('op', ')');
+    return { any: true, list: [] };
+  }
+  const list: SensEntry[] = [];
+  do {
+    let edge: 'posedge' | 'negedge' | 'level' = 'level';
+    if (p.match('posedge')) edge = 'posedge';
+    else if (p.match('negedge')) edge = 'negedge';
+    const e = p.parseExpr();
+    const sigName = exprToSignalName(e);
+    if (sigName) list.push({ signal: sigName, edge });
+  } while (p.match('op', ',') || p.match('id', 'or'));
+  p.expect('op', ')');
+  return { any: list.length === 0, list };
+}
+
+function exprToSignalName(e: Expr): string | null {
+  if (e.kind === 'id') return e.name;
+  if (e.kind === 'bit' && e.base.kind === 'id') return e.base.name;
+  if (e.kind === 'range' && e.base.kind === 'id') return e.base.name;
+  return null;
+}
+
+// Walk an expression and collect all signal names it reads (for @(*) inference)
+function collectReadSignals(e: Expr, out: Set<string>): void {
+  switch (e.kind) {
+    case 'id': out.add(e.name); return;
+    case 'bit': collectReadSignals(e.base, out); collectReadSignals(e.idx, out); return;
+    case 'range': collectReadSignals(e.base, out); return;
+    case 'concat': e.parts.forEach(p => collectReadSignals(p, out)); return;
+    case 'replicate': collectReadSignals(e.inner, out); return;
+    case 'unary': collectReadSignals(e.arg, out); return;
+    case 'binary': collectReadSignals(e.l, out); collectReadSignals(e.r, out); return;
+    case 'ternary': collectReadSignals(e.c, out); collectReadSignals(e.t, out); collectReadSignals(e.f, out); return;
+    case 'sysfunc': e.args.forEach(a => collectReadSignals(a, out)); return;
+    case 'num': return;
+  }
+}
+function collectStmtReadSignals(s: Stmt, out: Set<string>): void {
+  switch (s.kind) {
+    case 'block': s.body.forEach(c => collectStmtReadSignals(c, out)); return;
+    case 'assign': collectReadSignals(s.expr, out);
+      // Read indices from LHS that involve expressions
+      const lv = s.target;
+      if (lv.kind === 'bit') collectReadSignals(lv.idx, out);
+      if (lv.kind === 'memBitSel') { collectReadSignals(lv.idx, out); collectReadSignals(lv.bit, out); }
+      if (lv.kind === 'memRangeSel') collectReadSignals(lv.idx, out);
+      return;
+    case 'if': collectReadSignals(s.cond, out); collectStmtReadSignals(s.then, out); if (s.else) collectStmtReadSignals(s.else, out); return;
+    case 'case': collectReadSignals(s.sel, out);
+      s.items.forEach(it => { if (it.labels !== 'default') it.labels.forEach(l => collectReadSignals(l, out)); collectStmtReadSignals(it.body, out); });
+      return;
+    case 'for': collectStmtReadSignals(s.init, out); collectReadSignals(s.cond, out); collectStmtReadSignals(s.step, out); collectStmtReadSignals(s.body, out); return;
+    case 'while': collectReadSignals(s.cond, out); collectStmtReadSignals(s.body, out); return;
+    case 'repeat': collectReadSignals(s.count, out); collectStmtReadSignals(s.body, out); return;
+    case 'forever': collectStmtReadSignals(s.body, out); return;
+    case 'delay': if (s.inner) collectStmtReadSignals(s.inner, out); return;
+    case 'eventCtrl': if (s.inner) collectStmtReadSignals(s.inner, out); return;
+    case 'sys': s.args.forEach(a => { if ('kind' in a && a.kind !== 'str') collectReadSignals(a, out); }); return;
   }
 }
 
-// Evaluate continuous assignments for a module
-function evaluateContinuousAssigns(mod: VerilogModule, ctx: SimulationContext) {
-  for (const assign of mod.assigns) {
-    const val = evaluateExpression(assign.expression, ctx);
-    if (assign.targetBit !== undefined) {
-      handleBitAssign(assign.target, `[${assign.targetBit}]`, val, ctx);
-    } else if (assign.targetMsb !== undefined && assign.targetLsb !== undefined) {
-      handleBitAssign(assign.target, `[${assign.targetMsb}:${assign.targetLsb}]`, val, ctx);
+// ============================================================
+// Memory-array detection (parser doesn't expose these)
+// ============================================================
+
+interface MemoryDecl { name: string; width: number; depth: number }
+function stripCommentsRaw(src: string): string {
+  return src.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+}
+function findMemories(modSrc: string): MemoryDecl[] {
+  const mems: MemoryDecl[] = [];
+  const cleaned = stripCommentsRaw(modSrc);
+  // reg [W-1:0] name [0:N-1];   or   reg name [0:N-1];
+  const re = /\breg\s+(\[(\d+):(\d+)\])?\s*(\w+)\s*\[(\d+)\s*:\s*(\d+)\]\s*;/g;
+  let m;
+  while ((m = re.exec(cleaned)) !== null) {
+    const width = m[1] ? Math.abs(parseInt(m[2]) - parseInt(m[3])) + 1 : 1;
+    const a = parseInt(m[5]), b = parseInt(m[6]);
+    mems.push({ name: m[4], width, depth: Math.abs(a - b) + 1 });
+  }
+  return mems;
+}
+
+// always begin ... end  (no @ sensitivity — typically clock generators)
+function findUnsensitizedAlways(modSrcRaw: string): string[] {
+  const modSrc = stripCommentsRaw(modSrcRaw);
+  const out: string[] = [];
+  // Match `always` NOT followed by `@` (skipping any intervening whitespace).
+  // Plain `(?!@)` after greedy `\s*` fails — the engine can satisfy `\s*` with zero chars.
+  const re = /\balways\b(?!\s*@)/g;
+  let m;
+  while ((m = re.exec(modSrc)) !== null) {
+    const start = m.index + m[0].length;
+    // Take balanced begin/end or up to next ;
+    let i = start;
+    while (i < modSrc.length && /\s/.test(modSrc[i])) i++;
+    if (modSrc.slice(i, i + 5) === 'begin') {
+      let depth = 0; let j = i;
+      while (j < modSrc.length) {
+        if (modSrc.slice(j, j + 5).match(/^begin\b/)) { depth++; j += 5; continue; }
+        if (modSrc.slice(j, j + 3).match(/^end\b/)) { depth--; j += 3; if (depth === 0) break; continue; }
+        j++;
+      }
+      out.push(modSrc.slice(i, j));
     } else {
-      const port = mod.ports.find(p => p.name === assign.target);
-      const wire = mod.wires.find(w => w.name === assign.target);
-      const width = port?.width ?? wire?.width ?? 1;
-      ctx.setSignal(assign.target, val, width);
+      const semi = modSrc.indexOf(';', i);
+      if (semi !== -1) out.push(modSrc.slice(i, semi + 1));
+    }
+  }
+  return out;
+}
+
+// ============================================================
+// Simulator state
+// ============================================================
+
+interface Signal {
+  name: string;       // hierarchical
+  width: number;
+  value: V4;
+  // Subscribers fire whenever value changes
+  subscribers: Set<Subscriber>;
+  trace: SignalChange[];
+  recordChanges: boolean;
+}
+
+interface MemoryStore {
+  name: string;
+  width: number;
+  depth: number;
+  data: V4[];
+}
+
+type Subscriber = () => void;
+
+interface ScopeData {
+  path: string;
+  signals: Map<string, Signal>;
+  memories: Map<string, MemoryStore>;
+  mod: VerilogModule;
+}
+
+interface SchedEvent {
+  time: number;
+  region: 0 | 1; // 0 = active, 1 = NBA commit
+  seq: number;
+  fn: () => void;
+}
+
+class Scheduler {
+  events: SchedEvent[] = [];
+  now = 0;
+  seqCounter = 0;
+  finished = false;
+  maxTime = 100000;
+
+  schedule(time: number, region: 0 | 1, fn: () => void): void {
+    this.events.push({ time, region, seq: this.seqCounter++, fn });
+  }
+
+  run(): void {
+    while (!this.finished && this.events.length > 0) {
+      // Pop the earliest event by (time, region, seq)
+      let bestIdx = 0;
+      for (let i = 1; i < this.events.length; i++) {
+        const a = this.events[bestIdx], b = this.events[i];
+        if (b.time < a.time || (b.time === a.time && b.region < a.region) ||
+            (b.time === a.time && b.region === a.region && b.seq < a.seq)) {
+          bestIdx = i;
+        }
+      }
+      const e = this.events[bestIdx];
+      this.events.splice(bestIdx, 1);
+      if (e.time > this.maxTime) { this.now = this.maxTime; break; }
+      this.now = e.time;
+      try { e.fn(); } catch (err) {
+        if (err instanceof FinishSignal) { this.finished = true; break; }
+        throw err;
+      }
     }
   }
 }
 
-// Evaluate combinational always blocks
-function evaluateCombinational(mod: VerilogModule, ctx: SimulationContext) {
-  for (const block of mod.alwaysBlocks) {
-    if (block.type === 'combinational') {
-      executeBlock(block.body, ctx);
+class FinishSignal {}
+
+// ============================================================
+// Lookup helper: find signal by hierarchical name search
+// ============================================================
+
+class SimContext {
+  scopes: ScopeData[] = [];
+  signalsByName = new Map<string, Signal>();
+  topScope!: ScopeData;
+  tbScope!: ScopeData;
+  scheduler = new Scheduler();
+  errors: string[] = [];
+  logs: SimulationLog[] = [];
+  fileMap: Record<string, string> = {};
+  duration = 0;
+
+  resolveSignal(scope: ScopeData, name: string): Signal | undefined {
+    return scope.signals.get(name);
+  }
+
+  resolveMemory(scope: ScopeData, name: string): MemoryStore | undefined {
+    return scope.memories.get(name);
+  }
+}
+
+// ============================================================
+// Expression evaluator
+// ============================================================
+
+function evalExpr(e: Expr, scope: ScopeData, ctx: SimContext): { val: V4; w: number } {
+  switch (e.kind) {
+    case 'num': return { val: e.val, w: e.w };
+    case 'id': {
+      const sig = scope.signals.get(e.name);
+      if (sig) return { val: sig.value, w: sig.width };
+      // unknown identifier → x of width 1 (could be a memory reference used incorrectly)
+      return { val: v4X(1), w: 1 };
+    }
+    case 'bit': {
+      // base is identifier; check if it's a memory
+      if (e.base.kind === 'id') {
+        const mem = scope.memories.get(e.base.name);
+        if (mem) {
+          const idxR = evalExpr(e.idx, scope, ctx);
+          if (v4HasX(idxR.val, idxR.w)) return { val: v4X(mem.width), w: mem.width };
+          const i = Number(idxR.val.v);
+          if (i < 0 || i >= mem.depth) return { val: v4X(mem.width), w: mem.width };
+          return { val: mem.data[i], w: mem.width };
+        }
+      }
+      const baseR = evalExpr(e.base, scope, ctx);
+      const idxR = evalExpr(e.idx, scope, ctx);
+      if (v4HasX(idxR.val, idxR.w)) return { val: v4X(1), w: 1 };
+      const bit = Number(idxR.val.v);
+      return { val: v4Bit(baseR.val, bit), w: 1 };
+    }
+    case 'range': {
+      // Could be signal[m:l] or memory[i][m:l] (handled separately via 'memRangeSel' on RHS — but we don't have a memRange kind in Expr, so handle in parsePostfix would have created a 'bit' chain... fallback)
+      const baseR = evalExpr(e.base, scope, ctx);
+      const w = e.msb - e.lsb + 1;
+      return { val: v4Slice(baseR.val, e.msb, e.lsb), w };
+    }
+    case 'concat': {
+      const parts = e.parts.map(p => {
+        const r = evalExpr(p, scope, ctx);
+        return { val: r.val, w: r.w };
+      });
+      const c = v4Concat(parts);
+      return { val: c.val, w: c.w };
+    }
+    case 'replicate': {
+      const r = evalExpr(e.inner, scope, ctx);
+      const parts = Array.from({ length: e.count }, () => ({ val: r.val, w: r.w }));
+      const c = v4Concat(parts);
+      return { val: c.val, w: c.w };
+    }
+    case 'unary': {
+      const r = evalExpr(e.arg, scope, ctx);
+      switch (e.op) {
+        case '~': return { val: v4Not(r.val, r.w), w: r.w };
+        case '!': {
+          const b = v4Truthy(r.val, r.w) ? v4FromBig(0n, 1) : v4One();
+          if (v4HasX(r.val, r.w) && !((r.val.v & ~r.val.x & bmask(r.w)) !== 0n)) return { val: v4X(1), w: 1 };
+          return { val: b, w: 1 };
+        }
+        case '-': return { val: v4Sub(v4Zero(), r.val, r.w), w: r.w };
+        case '+': return r;
+        case '&':  return { val: v4ReduceAnd(r.val, r.w), w: 1 };
+        case '|':  return { val: v4ReduceOr(r.val, r.w),  w: 1 };
+        case '^':  return { val: v4ReduceXor(r.val, r.w), w: 1 };
+        case '~&': return { val: v4Not(v4ReduceAnd(r.val, r.w), 1), w: 1 };
+        case '~|': return { val: v4Not(v4ReduceOr(r.val, r.w),  1), w: 1 };
+        case '~^': return { val: v4Not(v4ReduceXor(r.val, r.w), 1), w: 1 };
+      }
+      return r;
+    }
+    case 'binary': {
+      const a = evalExpr(e.l, scope, ctx);
+      const b = evalExpr(e.r, scope, ctx);
+      const w = Math.max(a.w, b.w);
+      const A = v4Resize(a.val, w);
+      const B = v4Resize(b.val, w);
+      switch (e.op) {
+        case '+': return { val: v4Add(A, B, w), w };
+        case '-': return { val: v4Sub(A, B, w), w };
+        case '*': return { val: v4Mul(A, B, w), w };
+        case '/': return { val: v4Div(A, B, w), w };
+        case '%': return { val: v4Mod(A, B, w), w };
+        case '&': return { val: v4And(A, B, w), w };
+        case '|': return { val: v4Or(A, B, w),  w };
+        case '^': return { val: v4Xor(A, B, w), w };
+        case '<<': case '<<<': return { val: v4Shl(A, b.val, w), w };
+        case '>>': case '>>>': return { val: v4Shr(A, b.val, w), w };
+        case '<':  return { val: v4Lt(A, B, w),  w: 1 };
+        case '<=': return { val: v4Le(A, B, w),  w: 1 };
+        case '>':  return { val: v4Gt(A, B, w),  w: 1 };
+        case '>=': return { val: v4Ge(A, B, w),  w: 1 };
+        case '==': return { val: v4LogEq(A, B, w),  w: 1 };
+        case '!=': return { val: v4LogNeq(A, B, w), w: 1 };
+        case '===':return { val: v4CaseEq(A, B, w),  w: 1 };
+        case '!==':return { val: v4CaseNeq(A, B, w), w: 1 };
+        case '&&': {
+          const at = v4Truthy(A, w), bt = v4Truthy(B, w);
+          if (at && bt) return { val: v4One(), w: 1 };
+          // short-circuit not modeled; if either is firmly 0 → 0
+          const aZero = !at && !v4HasX(A, w);
+          const bZero = !bt && !v4HasX(B, w);
+          if (aZero || bZero) return { val: v4FromBig(0n, 1), w: 1 };
+          return { val: v4X(1), w: 1 };
+        }
+        case '||': {
+          const at = v4Truthy(A, w), bt = v4Truthy(B, w);
+          if (at || bt) return { val: v4One(), w: 1 };
+          if (!v4HasX(A, w) && !v4HasX(B, w)) return { val: v4FromBig(0n, 1), w: 1 };
+          return { val: v4X(1), w: 1 };
+        }
+      }
+      return { val: v4Zero(), w: 1 };
+    }
+    case 'ternary': {
+      const c = evalExpr(e.c, scope, ctx);
+      if (v4HasX(c.val, c.w)) {
+        const t = evalExpr(e.t, scope, ctx);
+        const f = evalExpr(e.f, scope, ctx);
+        const w = Math.max(t.w, f.w);
+        // x → propagate to bit-by-bit "x where t,f differ"
+        const T = v4Resize(t.val, w), F = v4Resize(f.val, w);
+        const m = bmask(w);
+        const diff = (T.v ^ F.v) & m;
+        return { val: { v: T.v & ~diff, x: diff | T.x | F.x }, w };
+      }
+      return v4Truthy(c.val, c.w) ? evalExpr(e.t, scope, ctx) : evalExpr(e.f, scope, ctx);
+    }
+    case 'sysfunc': {
+      if (e.name === '$time' || e.name === '$stime' || e.name === '$realtime') {
+        return { val: v4FromBig(BigInt(ctx.scheduler.now), 32), w: 32 };
+      }
+      return { val: v4Zero(), w: 32 };
     }
   }
 }
+
+// ============================================================
+// LValue write (with sensitivity firing)
+// ============================================================
+
+function writeSignal(sig: Signal, newVal: V4): void {
+  const w = sig.width;
+  const m = bmask(w);
+  const oldV = sig.value;
+  const masked: V4 = { v: newVal.v & m, x: newVal.x & m };
+  if ((masked.v & m) === (oldV.v & m) && (masked.x & m) === (oldV.x & m)) return;
+  sig.value = masked;
+  if (sig.recordChanges) {
+    sig.trace.push({ time: SCHED_NOW(), value: masked });
+  }
+  // Fire subscribers (snapshot — they may add new subscribers)
+  for (const fn of Array.from(sig.subscribers)) {
+    try { fn(); } catch (err) { if (err instanceof FinishSignal) throw err; /* swallow */ }
+  }
+}
+
+let CURRENT_SCHED: Scheduler | null = null;
+function SCHED_NOW(): number { return CURRENT_SCHED ? CURRENT_SCHED.now : 0; }
+
+function writeLValue(lv: LValue, val: V4, valW: number, scope: ScopeData, ctx: SimContext): void {
+  switch (lv.kind) {
+    case 'id': {
+      const sig = scope.signals.get(lv.name);
+      if (!sig) return;
+      writeSignal(sig, v4Resize(val, sig.width));
+      return;
+    }
+    case 'bit': {
+      // Could be signal[i] or memory[i]
+      const mem = scope.memories.get(lv.name);
+      if (mem) {
+        const idxR = evalExpr(lv.idx, scope, ctx);
+        if (v4HasX(idxR.val, idxR.w)) return;
+        const i = Number(idxR.val.v);
+        if (i < 0 || i >= mem.depth) return;
+        mem.data[i] = v4Resize(val, mem.width);
+        return;
+      }
+      const sig = scope.signals.get(lv.name);
+      if (!sig) return;
+      const idxR = evalExpr(lv.idx, scope, ctx);
+      if (v4HasX(idxR.val, idxR.w)) return;
+      const bit = Number(idxR.val.v);
+      const newVal = v4WriteSlice(sig.value, bit, bit, val, sig.width);
+      writeSignal(sig, newVal);
+      return;
+    }
+    case 'range': {
+      const sig = scope.signals.get(lv.name);
+      if (!sig) return;
+      const newVal = v4WriteSlice(sig.value, lv.msb, lv.lsb, val, sig.width);
+      writeSignal(sig, newVal);
+      return;
+    }
+    case 'memBitSel': {
+      const mem = scope.memories.get(lv.name);
+      if (!mem) return;
+      const idxR = evalExpr(lv.idx, scope, ctx);
+      if (v4HasX(idxR.val, idxR.w)) return;
+      const i = Number(idxR.val.v);
+      const bitR = evalExpr(lv.bit, scope, ctx);
+      if (v4HasX(bitR.val, bitR.w)) return;
+      const bit = Number(bitR.val.v);
+      if (i < 0 || i >= mem.depth) return;
+      mem.data[i] = v4WriteSlice(mem.data[i], bit, bit, val, mem.width);
+      return;
+    }
+    case 'memRangeSel': {
+      const mem = scope.memories.get(lv.name);
+      if (!mem) return;
+      const idxR = evalExpr(lv.idx, scope, ctx);
+      if (v4HasX(idxR.val, idxR.w)) return;
+      const i = Number(idxR.val.v);
+      if (i < 0 || i >= mem.depth) return;
+      mem.data[i] = v4WriteSlice(mem.data[i], lv.msb, lv.lsb, val, mem.width);
+      return;
+    }
+    case 'concat': {
+      // {a, b, c} = expr — split val across parts in declaration order (msb→lsb)
+      // Compute width of each part to slice
+      const partWidths: number[] = lv.parts.map(p => lvalWidth(p, scope));
+      let bitPos = partWidths.reduce((a, b) => a + b, 0); // total
+      for (let i = 0; i < lv.parts.length; i++) {
+        const w = partWidths[i];
+        bitPos -= w;
+        const partVal = v4Slice(val, bitPos + w - 1, bitPos);
+        writeLValue(lv.parts[i], partVal, w, scope, ctx);
+      }
+      return;
+    }
+  }
+}
+
+function lvalWidth(lv: LValue, scope: ScopeData): number {
+  switch (lv.kind) {
+    case 'id': return scope.signals.get(lv.name)?.width ?? 1;
+    case 'bit': return 1;
+    case 'range': return lv.msb - lv.lsb + 1;
+    case 'memBitSel': return 1;
+    case 'memRangeSel': return lv.msb - lv.lsb + 1;
+    case 'concat': return lv.parts.reduce((a, p) => a + lvalWidth(p, scope), 0);
+  }
+}
+
+// ============================================================
+// Statement execution as generators
+// ============================================================
+//
+// A process yields a "wait reason" until it should resume.
+// We call gen.next() to advance; the scheduler arranges resumption.
+
+type Yield =
+  | { type: 'delay'; ns: number }
+  | { type: 'wait'; signals: SensEntry[] };  // wait until any of these triggers
+
+function* execBlock(stmts: Stmt[], scope: ScopeData, ctx: SimContext): Generator<Yield, void, void> {
+  for (const s of stmts) yield* execStmt(s, scope, ctx);
+}
+
+function* execStmt(s: Stmt, scope: ScopeData, ctx: SimContext): Generator<Yield, void, void> {
+  switch (s.kind) {
+    case 'block':
+      yield* execBlock(s.body, scope, ctx);
+      return;
+    case 'assign': {
+      const r = evalExpr(s.expr, scope, ctx);
+      if (s.nonblocking) {
+        // Snapshot value, schedule commit in NBA region of current time
+        const valSnap = r.val, wSnap = r.w, lvSnap = s.target;
+        ctx.scheduler.schedule(ctx.scheduler.now, 1, () => {
+          writeLValue(lvSnap, valSnap, wSnap, scope, ctx);
+        });
+      } else {
+        writeLValue(s.target, r.val, r.w, scope, ctx);
+      }
+      return;
+    }
+    case 'delay': {
+      yield { type: 'delay', ns: s.ns };
+      if (s.inner) yield* execStmt(s.inner, scope, ctx);
+      return;
+    }
+    case 'eventCtrl': {
+      yield { type: 'wait', signals: s.sens.list };
+      if (s.inner) yield* execStmt(s.inner, scope, ctx);
+      return;
+    }
+    case 'if': {
+      const c = evalExpr(s.cond, scope, ctx);
+      if (v4Truthy(c.val, c.w)) yield* execStmt(s.then, scope, ctx);
+      else if (s.else) yield* execStmt(s.else, scope, ctx);
+      return;
+    }
+    case 'case': {
+      const sel = evalExpr(s.sel, scope, ctx);
+      let matched = false;
+      let defaultBody: Stmt | null = null;
+      for (const item of s.items) {
+        if (item.labels === 'default') { defaultBody = item.body; continue; }
+        if (matched) continue;
+        for (const lab of item.labels) {
+          const labV = evalExpr(lab, scope, ctx);
+          const w = Math.max(sel.w, labV.w);
+          const eq = v4CaseEq(v4Resize(sel.val, w), v4Resize(labV.val, w), w);
+          if (eq.v === 1n && eq.x === 0n) { matched = true; break; }
+        }
+        if (matched) { yield* execStmt(item.body, scope, ctx); break; }
+      }
+      if (!matched && defaultBody) yield* execStmt(defaultBody, scope, ctx);
+      return;
+    }
+    case 'for': {
+      yield* execStmt(s.init, scope, ctx);
+      let guard = 0;
+      while (guard++ < 100000) {
+        const c = evalExpr(s.cond, scope, ctx);
+        if (!v4Truthy(c.val, c.w)) break;
+        yield* execStmt(s.body, scope, ctx);
+        yield* execStmt(s.step, scope, ctx);
+      }
+      return;
+    }
+    case 'while': {
+      let guard = 0;
+      while (guard++ < 100000) {
+        const c = evalExpr(s.cond, scope, ctx);
+        if (!v4Truthy(c.val, c.w)) break;
+        yield* execStmt(s.body, scope, ctx);
+      }
+      return;
+    }
+    case 'repeat': {
+      const c = evalExpr(s.count, scope, ctx);
+      const n = v4HasX(c.val, c.w) ? 0 : Number(c.val.v);
+      for (let k = 0; k < n && k < 100000; k++) yield* execStmt(s.body, scope, ctx);
+      return;
+    }
+    case 'forever': {
+      let guard = 0;
+      while (guard++ < 1000000) {
+        yield* execStmt(s.body, scope, ctx);
+      }
+      return;
+    }
+    case 'sys': {
+      runSysTask(s, scope, ctx);
+      return;
+    }
+  }
+}
+
+function runSysTask(s: Stmt & { kind: 'sys' }, scope: ScopeData, ctx: SimContext): void {
+  switch (s.name) {
+    case '$display':
+    case '$write':
+    case '$monitor':
+    case '$strobe': {
+      const msg = formatDisplayArgs(s.args, scope, ctx);
+      ctx.logs.push({ time: ctx.scheduler.now, message: msg });
+      return;
+    }
+    case '$finish':
+    case '$stop': {
+      throw new FinishSignal();
+    }
+    case '$readmemh':
+    case '$readmemb': {
+      const fileArg = s.args[0];
+      const memArg = s.args[1];
+      if (!fileArg || (fileArg as { kind: string }).kind !== 'str') return;
+      const fname = (fileArg as { kind: 'str'; value: string }).value;
+      if (!memArg || (memArg as { kind: string }).kind !== 'id') return;
+      const memName = ((memArg as Expr) as { kind: 'id'; name: string }).name;
+      const mem = scope.memories.get(memName);
+      if (!mem) return;
+      const content = ctx.fileMap[fname] ?? Object.entries(ctx.fileMap).find(([k]) => k.endsWith('/' + fname) || k === fname)?.[1];
+      if (!content) {
+        ctx.errors.push(`$readmemh: file not found: ${fname}`);
+        return;
+      }
+      const radix = s.name === '$readmemh' ? 16 : 2;
+      readMemFromText(mem, content, radix);
+      return;
+    }
+    case '$dumpfile':
+    case '$dumpvars':
+    case '$dumpon':
+    case '$dumpoff':
+      return;
+  }
+}
+
+function readMemFromText(mem: MemoryStore, content: string, radix: number): void {
+  // Strip line comments and /* */ comments
+  const cleaned = content
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  const tokens = cleaned.split(/\s+/).map(t => t.trim().replace(/_/g, '')).filter(Boolean);
+  const w = mem.width;
+  let idx = 0;
+  for (const tok of tokens) {
+    if (idx >= mem.depth) break;
+    let v = 0n, x = 0n;
+    const bitsPerDigit = radix === 16 ? 4 : 1;
+    for (const ch of tok) {
+      const c = ch.toLowerCase();
+      v <<= BigInt(bitsPerDigit); x <<= BigInt(bitsPerDigit);
+      if (c === 'x' || c === 'z' || c === '?') {
+        x |= bmask(bitsPerDigit);
+      } else {
+        v |= BigInt(parseInt(c, radix));
+      }
+    }
+    mem.data[idx] = { v: v & bmask(w), x: x & bmask(w) };
+    idx++;
+  }
+}
+
+function formatDisplayArgs(args: (Expr | { kind: 'str'; value: string })[], scope: ScopeData, ctx: SimContext): string {
+  if (args.length === 0) return '';
+  const first = args[0];
+  // Format string?
+  if ('kind' in first && first.kind === 'str') {
+    let out = '';
+    let argi = 1;
+    const fmt = first.value;
+    for (let i = 0; i < fmt.length; i++) {
+      const c = fmt[i];
+      if (c === '%' && i + 1 < fmt.length) {
+        // skip optional width spec
+        let j = i + 1;
+        while (j < fmt.length && /[0-9]/.test(fmt[j])) j++;
+        const sp = fmt[j].toLowerCase();
+        const a = args[argi++];
+        const valR = a && (a as { kind: string }).kind !== 'str'
+          ? evalExpr(a as Expr, scope, ctx) : { val: v4Zero(), w: 0 };
+        switch (sp) {
+          case 'd': out += v4FormatDec(valR.val, valR.w); break;
+          case 'h': case 'x': out += v4FormatHex(valR.val, valR.w); break;
+          case 'b': out += v4FormatBin(valR.val, valR.w); break;
+          case 't': out += String(ctx.scheduler.now); break;
+          case 's': out += a && (a as { kind: string }).kind === 'str' ? (a as { kind: 'str'; value: string }).value : v4FormatDec(valR.val, valR.w); break;
+          case 'm': out += scope.path; break;
+          case '%': out += '%'; break;
+          default: out += sp;
+        }
+        i = j;
+      } else if (c === '\\' && i + 1 < fmt.length) {
+        const e = fmt[i + 1];
+        if (e === 'n') out += '\n';
+        else if (e === 't') out += '\t';
+        else out += e;
+        i++;
+      } else {
+        out += c;
+      }
+    }
+    return out;
+  }
+  // No format string — just space-separated decimals
+  return args.map(a => {
+    if ((a as { kind: string }).kind === 'str') return (a as { kind: 'str'; value: string }).value;
+    const r = evalExpr(a as Expr, scope, ctx);
+    return v4FormatDec(r.val, r.w);
+  }).join(' ');
+}
+
+// ============================================================
+// Process (initial / always) driver
+// ============================================================
+
+function runProcess(make: () => Generator<Yield, void, void>, scope: ScopeData, ctx: SimContext, restartOnFinish: boolean): void {
+  let gen = make();
+  const pump = (): void => {
+    while (true) {
+      let r;
+      try { r = gen.next(); } catch (err) {
+        if (err instanceof FinishSignal) throw err;
+        ctx.errors.push(`Runtime error: ${(err as Error).message}`);
+        return;
+      }
+      if (r.done) {
+        if (restartOnFinish) { gen = make(); continue; }
+        return;
+      }
+      const y = r.value;
+      if (y.type === 'delay') {
+        const target = ctx.scheduler.now + y.ns;
+        ctx.scheduler.schedule(target, 0, pump);
+        return;
+      }
+      if (y.type === 'wait') {
+        // Subscribe to the listed signals (or all signals if 'any' was empty)
+        const subs: { sig: Signal; cb: Subscriber }[] = [];
+        const fired = { v: false };
+        const onFire = (e: SensEntry, prev: V4, curr: V4) => {
+          if (fired.v) return;
+          if (e.edge === 'posedge') {
+            // 0→1 transition on bit 0
+            const oldB = (prev.v & 1n) - (prev.x & 1n);
+            const newB = (curr.v & 1n) - (curr.x & 1n);
+            if (oldB === 1n || newB !== 1n) return;
+          } else if (e.edge === 'negedge') {
+            const oldB = (prev.v & 1n);
+            const newB = (curr.v & 1n);
+            if (!(oldB === 1n && newB === 0n && (curr.x & 1n) === 0n)) return;
+          }
+          fired.v = true;
+          // Unsubscribe all
+          for (const { sig, cb } of subs) sig.subscribers.delete(cb);
+          // Resume on next active region tick at current time
+          ctx.scheduler.schedule(ctx.scheduler.now, 0, pump);
+        };
+        for (const e of y.signals) {
+          const sig = scope.signals.get(e.signal);
+          if (!sig) continue;
+          let prev = sig.value;
+          const cb = () => {
+            const curr = sig.value;
+            const p = prev; prev = curr;
+            onFire(e, p, curr);
+          };
+          sig.subscribers.add(cb);
+          subs.push({ sig, cb });
+        }
+        if (subs.length === 0) {
+          // No signals to wait on — drop process
+          return;
+        }
+        return;
+      }
+    }
+  };
+  pump();
+}
+
+// Continuous-assign style: re-evaluate `expr` and write `target` whenever any RHS signal changes
+function bindContinuous(target: LValue, expr: Expr, scope: ScopeData, ctx: SimContext): void {
+  const reads = new Set<string>();
+  collectReadSignals(expr, reads);
+  const evalAndWrite = () => {
+    const r = evalExpr(expr, scope, ctx);
+    writeLValue(target, r.val, r.w, scope, ctx);
+  };
+  // Also need RHS for index-bearing LValues? We treat target as simple here.
+  // Also for indexed LHS like x[i] = y, the i would need to be in the read set too.
+  collectLValueReads(target, reads);
+  // Initial evaluation
+  evalAndWrite();
+  // Subscribe — if a sig is later created, this won't pick it up. We bind once.
+  for (const sn of reads) {
+    const sig = scope.signals.get(sn);
+    if (!sig) continue;
+    sig.subscribers.add(evalAndWrite);
+  }
+}
+
+function collectLValueReads(lv: LValue, out: Set<string>): void {
+  switch (lv.kind) {
+    case 'bit': collectReadSignals(lv.idx, out); return;
+    case 'memBitSel': collectReadSignals(lv.idx, out); collectReadSignals(lv.bit, out); return;
+    case 'memRangeSel': collectReadSignals(lv.idx, out); return;
+    case 'concat': lv.parts.forEach(p => collectLValueReads(p, out)); return;
+  }
+}
+
+// Bind an `always @(*)` or always with explicit list
+function bindAlways(stmts: Stmt[], sens: Sensitivity | 'auto', scope: ScopeData, ctx: SimContext): void {
+  const reads = new Set<string>();
+  for (const s of stmts) collectStmtReadSignals(s, reads);
+
+  const isEdgeSensitive = sens !== 'auto' && sens.list.some(e => e.edge === 'posedge' || e.edge === 'negedge');
+
+  if (isEdgeSensitive) {
+    // Edge sensitive: model as a process that loops { wait edge; run body }
+    const sensList = (sens as Sensitivity).list;
+    const make = function* (): Generator<Yield, void, void> {
+      yield { type: 'wait', signals: sensList };
+      yield* execBlock(stmts, scope, ctx);
+    };
+    runProcess(make, scope, ctx, /*restartOnFinish=*/true);
+    return;
+  }
+
+  // Level-sensitive (always @(*) or named list): re-run body whenever any read sig changes
+  const fire = () => {
+    // Run the whole body synchronously (no delays expected in pure-comb always @(*))
+    const gen = execBlock(stmts, scope, ctx);
+    while (true) {
+      const r = gen.next();
+      if (r.done) return;
+      // If a comb body has a delay, defer rest — but practically, this shouldn't happen.
+      const y = r.value;
+      if (y.type === 'delay') {
+        ctx.scheduler.schedule(ctx.scheduler.now + y.ns, 0, () => {
+          while (!gen.next().done) {/* ignore further yields */}
+        });
+        return;
+      }
+      if (y.type === 'wait') return;
+    }
+  };
+
+  // Determine sources: explicit list if non-'*'; else collected reads
+  let sources: string[];
+  if (sens !== 'auto' && !sens.any && sens.list.length > 0) {
+    sources = sens.list.map(e => e.signal);
+  } else {
+    sources = Array.from(reads);
+  }
+
+  // Initial run
+  fire();
+  for (const sn of sources) {
+    const sig = scope.signals.get(sn);
+    if (!sig) continue;
+    sig.subscribers.add(fire);
+  }
+}
+
+// ============================================================
+// Module elaboration
+// ============================================================
+
+interface ElabSlot {
+  scope: ScopeData;
+  // Map from local-port-name → parent signal name (for I/O connection)
+  parentBindings: { localPort: string; parentSignal: string; direction: 'input'|'output'|'inout'; localWidth: number; parentWidth: number }[];
+}
+
+function elaborate(
+  modules: VerilogModule[],
+  topName: string,
+  tbName: string,
+  ctx: SimContext,
+): void {
+  const byName = new Map(modules.map(m => [m.name, m]));
+
+  function makeScope(mod: VerilogModule, path: string): ScopeData {
+    const sc: ScopeData = {
+      path,
+      signals: new Map(),
+      memories: new Map(),
+      mod,
+    };
+    // Allocate signals from ports, wires, regs
+    const allDecls: { name: string; width: number }[] = [];
+    for (const p of mod.ports) allDecls.push({ name: p.name, width: p.width });
+    for (const w of mod.wires) allDecls.push({ name: w.name, width: w.width });
+    for (const r of mod.regs) allDecls.push({ name: r.name, width: r.width });
+    // Memory declarations
+    const mems = findMemories(mod.raw);
+    const memNames = new Set(mems.map(m => m.name));
+    for (const decl of allDecls) {
+      if (memNames.has(decl.name)) continue;
+      if (sc.signals.has(decl.name)) continue;
+      const sig: Signal = {
+        name: `${path}.${decl.name}`,
+        width: decl.width,
+        value: v4X(decl.width),
+        subscribers: new Set(),
+        trace: [{ time: 0, value: v4X(decl.width) }],
+        recordChanges: true,
+      };
+      sc.signals.set(decl.name, sig);
+      ctx.signalsByName.set(sig.name, sig);
+    }
+    for (const mem of mems) {
+      const data: V4[] = Array.from({ length: mem.depth }, () => v4X(mem.width));
+      sc.memories.set(mem.name, { name: mem.name, width: mem.width, depth: mem.depth, data });
+    }
+    ctx.scopes.push(sc);
+    return sc;
+  }
+
+  function compileScope(sc: ScopeData): void {
+    const mod = sc.mod;
+
+    // Continuous assigns
+    for (const a of mod.assigns) {
+      try {
+        const exprAst = new Parser(tokenize(a.expression)).parseExpr();
+        // Build LValue for the target
+        let target: LValue;
+        if (a.targetBit !== undefined) {
+          target = { kind: 'bit', name: a.target, idx: { kind: 'num', w: 32, val: v4FromNum(a.targetBit, 32) } };
+        } else if (a.targetMsb !== undefined && a.targetLsb !== undefined) {
+          target = { kind: 'range', name: a.target, msb: a.targetMsb, lsb: a.targetLsb };
+        } else {
+          // Could be concat LHS; the existing parser doesn't support it. Detect manually.
+          target = { kind: 'id', name: a.target };
+        }
+        bindContinuous(target, exprAst, sc, ctx);
+      } catch (err) {
+        ctx.errors.push(`assign in ${sc.path}: ${(err as Error).message}`);
+      }
+    }
+    // Handle concat-LHS continuous assigns directly from raw source (parser misses these)
+    const concatAssignRe = /\bassign\s*\{([^}]+)\}\s*=\s*([^;]+);/g;
+    let cm;
+    while ((cm = concatAssignRe.exec(mod.raw)) !== null) {
+      try {
+        const partsSrc = cm[1].split(',').map(s => s.trim()).filter(Boolean);
+        const parts: LValue[] = partsSrc.map(s => {
+          const t = tokenize(s);
+          const lv = parseLValue(new Parser(t));
+          return lv ?? { kind: 'id', name: s };
+        });
+        const exprAst = new Parser(tokenize(cm[2])).parseExpr();
+        bindContinuous({ kind: 'concat', parts }, exprAst, sc, ctx);
+      } catch { /* ignore */ }
+    }
+
+    // Initial blocks
+    for (const ib of mod.initialBlocks) {
+      try {
+        const stmts = parseStatementsFromString(ib.body);
+        runProcess(() => execBlock(stmts, sc, ctx), sc, ctx, false);
+      } catch (err) {
+        ctx.errors.push(`initial in ${sc.path}: ${(err as Error).message}`);
+      }
+    }
+
+    // Always blocks (with @(...) sensitivity)
+    for (const ab of mod.alwaysBlocks) {
+      try {
+        const stmts = parseStatementsFromString(ab.body);
+        const sens = parseSensitivityFromString(ab.sensitivity);
+        bindAlways(stmts, sens, sc, ctx);
+      } catch (err) {
+        ctx.errors.push(`always in ${sc.path}: ${(err as Error).message}`);
+      }
+    }
+
+    // Always blocks WITHOUT sensitivity (clock generators etc.)
+    for (const body of findUnsensitizedAlways(mod.raw)) {
+      try {
+        const stmts = parseStatementsFromString(body);
+        // Wrap in forever-loop semantics: such a block runs forever, restarting at end
+        const make = function* (): Generator<Yield, void, void> {
+          yield* execBlock(stmts, sc, ctx);
+        };
+        runProcess(make, sc, ctx, /*restartOnFinish=*/true);
+      } catch (err) {
+        ctx.errors.push(`always in ${sc.path}: ${(err as Error).message}`);
+      }
+    }
+
+    // Submodule instances — recurse
+    for (const inst of mod.instances) {
+      const sub = byName.get(inst.moduleName);
+      if (!sub) continue;
+      const subPath = `${sc.path}.${inst.instanceName}`;
+      const subScope = makeScope(sub, subPath);
+      // Wire ports: for each sub port, find connected expression in parent scope, mirror via continuous assigns.
+      for (let i = 0; i < sub.ports.length; i++) {
+        const port = sub.ports[i];
+        let expr: string | undefined;
+        if (inst.positionalArgs) expr = inst.positionalArgs[i];
+        else expr = inst.connections[port.name];
+        if (!expr) continue;
+        try {
+          const eAst = new Parser(tokenize(expr)).parseExpr();
+          if (port.direction === 'input') {
+            // parent expr → sub port (write sub port whenever parent expr changes)
+            const target: LValue = { kind: 'id', name: port.name };
+            bindContinuous(target, eAst, sc, ctx);
+            // Hmm — we need the target in subScope, not sc. Adjust:
+          }
+          // We'll instead build a combined "bridge" below — replace this temporarily
+        } catch { /* ignore */ }
+      }
+      compileScope(subScope);
+      // After child compile, set up bidirectional bindings using a small helper
+      bridgeInstance(sc, subScope, inst, sub, ctx);
+    }
+  }
+
+  const tbMod = byName.get(tbName);
+  if (!tbMod) { ctx.errors.push(`Testbench module not found: ${tbName}`); return; }
+  ctx.tbScope = makeScope(tbMod, tbName);
+  ctx.topScope = ctx.tbScope;
+  compileScope(ctx.tbScope);
+}
+
+function parseSensitivityFromString(s: string): Sensitivity {
+  if (!s) return { any: true, list: [] };
+  const t = s.trim();
+  if (t === '*') return { any: true, list: [] };
+  // tokenize & parse a sensitivity list — wrap with "@(...)" for the parser
+  const toks = tokenize('(' + t + ')');
+  const p = new Parser(toks);
+  if (!p.match('op', '(')) return { any: false, list: [] };
+  if (p.match('op', '*')) { p.expect('op', ')'); return { any: true, list: [] }; }
+  const list: SensEntry[] = [];
+  do {
+    let edge: 'posedge' | 'negedge' | 'level' = 'level';
+    if (p.match('posedge')) edge = 'posedge';
+    else if (p.match('negedge')) edge = 'negedge';
+    if (!p.check('id')) break;
+    const e = p.parseExpr();
+    const sn = exprToSignalName(e);
+    if (sn) list.push({ signal: sn, edge });
+  } while (p.match('op', ',') || p.match('id', 'or'));
+  return { any: list.length === 0, list };
+}
+
+// ============================================================
+// Port bridging between parent and child instance
+// ============================================================
+
+function bridgeInstance(
+  parent: ScopeData,
+  child: ScopeData,
+  inst: { moduleName: string; instanceName: string; connections: Record<string, string>; positionalArgs?: string[] },
+  childMod: VerilogModule,
+  ctx: SimContext,
+): void {
+  for (let i = 0; i < childMod.ports.length; i++) {
+    const port = childMod.ports[i];
+    let expr: string | undefined;
+    if (inst.positionalArgs) expr = inst.positionalArgs[i];
+    else expr = inst.connections[port.name];
+    if (!expr) continue;
+    try {
+      const exprAst = new Parser(tokenize(expr)).parseExpr();
+      const childPortLv: LValue = { kind: 'id', name: port.name };
+      const parentLv = exprToLValue(expr);
+
+      if (port.direction === 'input') {
+        // parent expr → child port
+        bindContinuous(childPortLv, exprAst, parent, ctx);
+        // BUT: the LHS lives in `child` scope. We need a custom binder.
+        bindCrossScope(parent, child, exprAst, childPortLv, ctx);
+      } else if (port.direction === 'output') {
+        // child port → parent expr
+        const childExprAst: Expr = { kind: 'id', name: port.name };
+        if (parentLv) bindCrossScope(child, parent, childExprAst, parentLv, ctx);
+      } else {
+        // inout — bidirectional, but we approximate as input (parent→child)
+        bindCrossScope(parent, child, exprAst, childPortLv, ctx);
+      }
+    } catch { /* ignore */ }
+  }
+}
+
+function bindCrossScope(srcScope: ScopeData, dstScope: ScopeData, srcExpr: Expr, dstLv: LValue, ctx: SimContext): void {
+  const reads = new Set<string>();
+  collectReadSignals(srcExpr, reads);
+  collectLValueReads(dstLv, reads); // dst index reads are in dstScope, but typically constant
+  const fire = () => {
+    const r = evalExpr(srcExpr, srcScope, ctx);
+    writeLValue(dstLv, r.val, r.w, dstScope, ctx);
+  };
+  fire();
+  for (const sn of reads) {
+    const sig = srcScope.signals.get(sn);
+    if (sig) sig.subscribers.add(fire);
+  }
+}
+
+function exprToLValue(src: string): LValue | null {
+  try {
+    const toks = tokenize(src);
+    const p = new Parser(toks);
+    return parseLValue(p);
+  } catch { return null; }
+}
+
+// ============================================================
+// Public entry point
+// ============================================================
 
 export function simulate(
   sources: Record<string, string>,
   topModule: string,
   testbenchModule: string,
-  maxTimeNs: number = 1000
+  maxTimeNs: number = 2000,
+  files: Record<string, string> = {},
 ): SimulationResult {
-  const errors: string[] = [];
   const allModules: VerilogModule[] = [];
-
-  // Parse all sources
+  const errors: string[] = [];
   for (const [filename, source] of Object.entries(sources)) {
-    const result = parseVerilog(source);
-    if (result.errors.length > 0) {
-      errors.push(...result.errors.map(e => `${filename}: ${e}`));
-    }
-    allModules.push(...result.modules);
+    const r = parseVerilog(source);
+    if (r.errors.length > 0) for (const e of r.errors) errors.push(`${filename}: ${e}`);
+    allModules.push(...r.modules);
   }
 
-  if (errors.length > 0) {
-    return { waveform: [], signals: [], signalWidths: {}, errors, logs: [], duration: 0 };
+  const ctx = new SimContext();
+  ctx.fileMap = { ...sources, ...files };
+  ctx.scheduler.maxTime = maxTimeNs;
+  CURRENT_SCHED = ctx.scheduler;
+
+  try {
+    elaborate(allModules, topModule, testbenchModule, ctx);
+  } catch (err) {
+    if (!(err instanceof FinishSignal)) errors.push(`Elaboration error: ${(err as Error).message}`);
   }
 
-  const designMod = allModules.find(m => m.name === topModule);
-  const tbMod = allModules.find(m => m.name === testbenchModule);
-
-  if (!tbMod) {
-    errors.push(`Testbench module '${testbenchModule}' not found`);
-    return { waveform: [], signals: [], signalWidths: {}, errors, logs: [], duration: 0 };
+  // Run scheduler
+  try {
+    ctx.scheduler.run();
+  } catch (err) {
+    if (!(err instanceof FinishSignal)) errors.push(`Sim error: ${(err as Error).message}`);
   }
+  ctx.duration = ctx.scheduler.now;
+  CURRENT_SCHED = null;
 
-  const ctx = new SimulationContext(allModules);
-  ctx.maxTime = maxTimeNs;
-
-  // Initialize testbench signals
-  for (const reg of tbMod.regs) {
-    ctx.setSignal(reg.name, 0, reg.width);
-  }
-  for (const wire of tbMod.wires) {
-    ctx.setSignal(wire.name, 0, wire.width);
-  }
-
-  // Initialize design module signals
-  if (designMod) {
-    for (const port of designMod.ports) {
-      ctx.setSignal(port.name, 0, port.width);
-    }
-    for (const wire of designMod.wires) {
-      ctx.setSignal(wire.name, 0, wire.width);
-    }
-    for (const reg of designMod.regs) {
-      ctx.setSignal(reg.name, 0, reg.width);
-    }
-  }
-
-  ctx.recordState();
-
-  // Execute initial blocks from testbench
-  for (const initial of tbMod.initialBlocks) {
-    executeBlock(initial.body, ctx);
-    ctx.recordState();
-  }
-
-  // After initial blocks run, evaluate continuous assignments and combinational logic
-  if (designMod) {
-    // Map testbench connections to design module ports via instances
-    for (const inst of tbMod.instances) {
-      if (inst.moduleName === topModule && designMod) {
-        // Copy connected signals
-        for (const [portName, wireName] of Object.entries(inst.connections)) {
-          const port = designMod.ports.find(p => p.name === portName);
-          if (port && port.direction === 'input') {
-            ctx.setSignal(portName, ctx.getSignal(wireName), port.width);
-          }
-        }
-      }
-    }
-
-    evaluateContinuousAssigns(designMod, ctx);
-    evaluateCombinational(designMod, ctx);
-
-    // Copy outputs back
-    for (const inst of tbMod.instances) {
-      if (inst.moduleName === topModule) {
-        for (const [portName, wireName] of Object.entries(inst.connections)) {
-          const port = designMod.ports.find(p => p.name === portName);
-          if (port && port.direction === 'output') {
-            ctx.setSignal(wireName, ctx.getSignal(portName), port.width);
-          }
-        }
-      }
-    }
-  }
-
-  // Handle clock-based simulation
-  const clockSignals: string[] = [];
-  for (const block of tbMod.alwaysBlocks) {
-    // Check for clock generation patterns: always #5 clk = ~clk;
-    const clkMatch = block.body.match(/(\w+)\s*[<]?=\s*~\1/);
-    if (clkMatch) clockSignals.push(clkMatch[1]);
-  }
-
-  // Check for always blocks with delay
-  const alwaysDelayRegex = /always\s*#(\d+)\s+(.+)/g;
-  const rawTb = tbMod.raw;
-  let alwaysDelayMatch;
-  const clockGenerators: { period: number; body: string }[] = [];
-  while ((alwaysDelayMatch = alwaysDelayRegex.exec(rawTb)) !== null) {
-    clockGenerators.push({
-      period: parseInt(alwaysDelayMatch[1]),
-      body: alwaysDelayMatch[2],
-    });
-  }
-
-  // Run clock-based simulation if there are clocks
-  if (clockGenerators.length > 0 && ctx.time < ctx.maxTime) {
-    const minPeriod = Math.min(...clockGenerators.map(c => c.period));
-    while (ctx.time < ctx.maxTime) {
-      ctx.time += minPeriod;
-
-      // Toggle clocks
-      for (const gen of clockGenerators) {
-        if (ctx.time % gen.period === 0) {
-          executeStatement(gen.body.trim(), ctx);
-        }
-      }
-
-      // Propagate through design
-      if (designMod) {
-        for (const inst of tbMod.instances) {
-          if (inst.moduleName === topModule) {
-            for (const [portName, wireName] of Object.entries(inst.connections)) {
-              const port = designMod.ports.find(p => p.name === portName);
-              if (port && port.direction === 'input') {
-                ctx.setSignal(portName, ctx.getSignal(wireName), port.width);
-              }
-            }
-          }
-        }
-
-        // Execute sequential always blocks on clock edges
-        for (const block of designMod.alwaysBlocks) {
-          if (block.type === 'sequential') {
-            // Check if the relevant clock edge occurred
-            executeBlock(block.body, ctx);
-          }
-        }
-
-        evaluateContinuousAssigns(designMod, ctx);
-        evaluateCombinational(designMod, ctx);
-
-        for (const inst of tbMod.instances) {
-          if (inst.moduleName === topModule) {
-            for (const [portName, wireName] of Object.entries(inst.connections)) {
-              const port = designMod.ports.find(p => p.name === portName);
-              if (port && port.direction === 'output') {
-                ctx.setSignal(wireName, ctx.getSignal(portName), port.width);
-              }
-            }
-          }
-        }
-      }
-
-      ctx.recordState();
-    }
-  }
-
-  // Collect signal info
-  const signalNames: string[] = [];
+  // Build output
+  const signals: SignalTrace[] = [];
+  const signalsByName: Record<string, SignalTrace> = {};
   const signalWidths: Record<string, number> = {};
-  for (const [name, sv] of Object.entries(ctx.signals)) {
-    signalNames.push(name);
-    signalWidths[name] = sv.width;
+  for (const sig of ctx.signalsByName.values()) {
+    const trace: SignalTrace = {
+      name: sig.name,
+      width: sig.width,
+      isMemory: false,
+      changes: sig.trace,
+    };
+    signals.push(trace);
+    signalsByName[sig.name] = trace;
+    // Also expose unqualified name for backwards compat (last-write-wins; deeper hierarchies will just shadow)
+    const last = sig.name.split('.').pop()!;
+    if (!signalsByName[last]) signalsByName[last] = trace;
+    signalWidths[sig.name] = sig.width;
+    signalWidths[last] = sig.width;
   }
+  signals.sort((a, b) => a.name.localeCompare(b.name));
 
   return {
-    waveform: ctx.waveform,
-    signals: signalNames.sort(),
-    signalWidths,
-    errors: ctx.errors,
+    signals,
+    signalsByName,
+    duration: ctx.duration,
+    timeUnitNs: 1,
+    errors: [...errors, ...ctx.errors],
     logs: ctx.logs,
-    duration: ctx.time,
+    signalWidths,
   };
-}
-
-// ─── Helper: read a signal expression that may include bit/range selects ───
-
-function readExpr(expr: string, ctx: SimulationContext): number {
-  expr = expr.trim();
-  // Numeric literal (e.g. 0, 1, 1'b0)
-  if (/^\d+$/.test(expr)) return parseInt(expr, 10);
-  const numMatch = expr.match(/^(\d+)'([bhd])([0-9a-fA-F_]+)$/);
-  if (numMatch) {
-    const base = numMatch[2] === 'b' ? 2 : numMatch[2] === 'h' ? 16 : 10;
-    return parseInt(numMatch[3].replace(/_/g, ''), base);
-  }
-  // Bit select: name[N]
-  const bitSel = expr.match(/^(\w+)\[(\d+)\]$/);
-  if (bitSel) return (ctx.getSignal(bitSel[1]) >> parseInt(bitSel[2])) & 1;
-  // Range select: name[M:L]
-  const rangeSel = expr.match(/^(\w+)\[(\d+):(\d+)\]$/);
-  if (rangeSel) {
-    const msb = parseInt(rangeSel[2]), lsb = parseInt(rangeSel[3]);
-    return (ctx.getSignal(rangeSel[1]) >> lsb) & ((1 << (msb - lsb + 1)) - 1);
-  }
-  // Simple signal
-  if (/^\w+$/.test(expr)) return ctx.getSignal(expr);
-  return 0;
-}
-
-function writeExpr(expr: string, val: number, width: number, ctx: SimulationContext) {
-  expr = expr.trim();
-  // Bit select: name[N]
-  const bitSel = expr.match(/^(\w+)\[(\d+)\]$/);
-  if (bitSel) {
-    const name = bitSel[1];
-    const bit = parseInt(bitSel[2]);
-    const current = ctx.getSignal(name);
-    const w = ctx.getSignalWidth(name) || (bit + 1);
-    ctx.setSignal(name, (current & ~(1 << bit)) | ((val & 1) << bit), w);
-    return;
-  }
-  // Range select: name[M:L]
-  const rangeSel = expr.match(/^(\w+)\[(\d+):(\d+)\]$/);
-  if (rangeSel) {
-    const name = rangeSel[1];
-    const msb = parseInt(rangeSel[2]), lsb = parseInt(rangeSel[3]);
-    const rw = msb - lsb + 1;
-    const mask = ((1 << rw) - 1) << lsb;
-    const current = ctx.getSignal(name);
-    const w = ctx.getSignalWidth(name) || (msb + 1);
-    ctx.setSignal(name, (current & ~mask) | ((val & ((1 << rw) - 1)) << lsb), w);
-    return;
-  }
-  // Simple signal
-  ctx.setSignal(expr, val, width);
-}
-
-// ─── Evaluate a single module (non-recursive helper) ───
-
-function evaluateModule(
-  mod: VerilogModule,
-  allModules: VerilogModule[],
-  inputs: Record<string, number>,
-  depth: number,
-): Record<string, number> {
-  if (depth > 20) return {}; // prevent runaway recursion
-
-  const ctx = new SimulationContext(allModules);
-
-  // Set up ports
-  for (const port of mod.ports) {
-    if (port.direction === 'input') {
-      ctx.setSignal(port.name, inputs[port.name] ?? 0, port.width);
-    } else {
-      ctx.setSignal(port.name, 0, port.width);
-    }
-  }
-  for (const wire of mod.wires) {
-    ctx.setSignal(wire.name, 0, wire.width);
-  }
-  for (const reg of mod.regs) {
-    ctx.setSignal(reg.name, 0, reg.width);
-  }
-
-  // Iterate for propagation
-  for (let iter = 0; iter < 10; iter++) {
-    evaluateContinuousAssigns(mod, ctx);
-    evaluateCombinational(mod, ctx);
-
-    // Gate primitives
-    for (const g of mod.gatePrimitives) {
-      const inputVals = g.inputs.map(name => readExpr(name, ctx) & 1);
-      let outVal: number;
-      switch (g.gate) {
-        case 'and':  outVal = inputVals.reduce((a, b) => a & b, 1); break;
-        case 'nand': outVal = inputVals.reduce((a, b) => a & b, 1) ^ 1; break;
-        case 'or':   outVal = inputVals.reduce((a, b) => a | b, 0); break;
-        case 'nor':  outVal = inputVals.reduce((a, b) => a | b, 0) ^ 1; break;
-        case 'xor':  outVal = inputVals.reduce((a, b) => a ^ b, 0); break;
-        case 'xnor': outVal = inputVals.reduce((a, b) => a ^ b, 0) ^ 1; break;
-        case 'not':  outVal = inputVals[0] ^ 1; break;
-        case 'buf':  outVal = inputVals[0]; break;
-        default:     outVal = 0;
-      }
-      writeExpr(g.output, outVal, 1, ctx);
-    }
-
-    // Module instances (hierarchical)
-    for (const inst of mod.instances) {
-      const subMod = allModules.find(m => m.name === inst.moduleName);
-      if (!subMod) continue;
-
-      // Build sub-module inputs from connections
-      const subInputs: Record<string, number> = {};
-      for (const port of subMod.ports) {
-        if (port.direction !== 'input') continue;
-
-        let expr: string | undefined;
-        if (inst.positionalArgs) {
-          // Positional: map by port order index
-          const idx = subMod.ports.indexOf(port);
-          expr = idx >= 0 ? inst.positionalArgs[idx] : undefined;
-        } else {
-          expr = inst.connections[port.name];
-        }
-        if (expr !== undefined) {
-          subInputs[port.name] = readExpr(expr, ctx);
-        }
-      }
-
-      // Recursively evaluate the sub-module
-      const subOutputs = evaluateModule(subMod, allModules, subInputs, depth + 1);
-
-      // Write sub-module outputs back to parent signals
-      for (const port of subMod.ports) {
-        if (port.direction !== 'output') continue;
-
-        let expr: string | undefined;
-        if (inst.positionalArgs) {
-          const idx = subMod.ports.indexOf(port);
-          expr = idx >= 0 ? inst.positionalArgs[idx] : undefined;
-        } else {
-          expr = inst.connections[port.name];
-        }
-        if (expr !== undefined && subOutputs[port.name] !== undefined) {
-          writeExpr(expr, subOutputs[port.name], port.width, ctx);
-        }
-      }
-    }
-  }
-
-  const outputs: Record<string, number> = {};
-  for (const port of mod.ports) {
-    if (port.direction === 'output') {
-      outputs[port.name] = ctx.getSignal(port.name);
-    }
-  }
-  return outputs;
-}
-
-// Simple combinational-only evaluation for FPGA board simulation
-export function evaluateDesign(
-  source: string,
-  moduleName: string,
-  inputs: Record<string, number>
-): Record<string, number> {
-  const result = parseVerilog(source);
-  if (result.errors.length > 0 || result.modules.length === 0) {
-    return {};
-  }
-
-  const mod = result.modules.find(m => m.name === moduleName) || result.modules[0];
-  return evaluateModule(mod, result.modules, inputs, 0);
 }

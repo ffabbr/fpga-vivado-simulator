@@ -11,9 +11,11 @@ import { Input } from '@/components/ui/input';
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem,
   ContextMenuSeparator, ContextMenuTrigger,
+  ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent,
 } from '@/components/ui/context-menu';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
+  DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel,
@@ -40,6 +42,7 @@ interface FileExplorerProps {
   onAddFile: (file: ProjectFile) => void;
   onDeleteFile: (id: string) => void;
   onRenameFile: (id: string, name: string) => void;
+  onSetFileType: (id: string, type: ProjectFile['type']) => void;
   onSetTopModule: (name: string) => void;
 }
 
@@ -52,7 +55,7 @@ const FILE_ICONS: Record<string, React.ReactNode> = {
 };
 
 export default function FileExplorer({
-  files, activeFileId, topModule, isSynthesizing, isSimulating, createDialogOpen, onCreateDialogOpenChange, onOpenFile, onAddFile, onDeleteFile, onRenameFile, onSetTopModule,
+  files, activeFileId, topModule, isSynthesizing, isSimulating, createDialogOpen, onCreateDialogOpenChange, onOpenFile, onAddFile, onDeleteFile, onRenameFile, onSetFileType, onSetTopModule,
 }: FileExplorerProps) {
   const [internalDialogOpen, setInternalDialogOpen] = useState(false);
   const isCreateDialogOpen = createDialogOpen ?? internalDialogOpen;
@@ -65,19 +68,20 @@ export default function FileExplorer({
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCounter = useRef(0);
 
-  const detectFileType = useCallback((name: string): ProjectFile['type'] => {
+  const detectFileType = useCallback((name: string): ProjectFile['type'] | null => {
     const lower = name.toLowerCase();
     if (lower.endsWith('.xdc')) return 'constraints';
     if (lower.endsWith('_tb.v') || lower.endsWith('_tb.sv')) return 'testbench';
     if (lower.endsWith('.v') || lower.endsWith('.sv') || lower.endsWith('.vh')) return 'verilog';
-    return 'other';
+    if (lower.endsWith('.txt') || lower.endsWith('.mem') || lower.endsWith('.hex') || lower.endsWith('.dat')) return 'memory';
+    return null;
   }, []);
 
   const handleDroppedFiles = useCallback((droppedFiles: FileList) => {
     Array.from(droppedFiles).forEach(file => {
       const name = file.name;
       const type = detectFileType(name);
-      if (type === 'other') return; // skip unsupported files
+      if (!type) return; // skip unsupported files
       file.text().then(content => {
         onAddFile(createFile(name, content, type));
       });
@@ -129,9 +133,18 @@ export default function FileExplorer({
       case 'verilog': return 'Design Source (Verilog)';
       case 'testbench': return 'Testbench';
       case 'constraints': return 'Constraints (.xdc)';
+      case 'memory': return 'Memory';
       default: return 'Other';
     }
   }, []);
+
+  const FILE_TYPE_OPTIONS: { value: ProjectFile['type']; label: string; icon: React.ReactNode }[] = [
+    { value: 'verilog',     label: 'Design Source',  icon: <FileCode2 className="h-3.5 w-3.5 mr-2 text-blue-500" /> },
+    { value: 'testbench',   label: 'Testbench',       icon: <TestTube2 className="h-3.5 w-3.5 mr-2 text-green-500" /> },
+    { value: 'constraints', label: 'Constraints',     icon: <Settings2 className="h-3.5 w-3.5 mr-2 text-yellow-500" /> },
+    { value: 'memory',      label: 'Memory',          icon: <Cpu className="h-3.5 w-3.5 mr-2 text-purple-500" /> },
+    { value: 'other',       label: 'Other',           icon: <FileText className="h-3.5 w-3.5 mr-2 text-muted-foreground" /> },
+  ];
 
   const onCreateTypeChange = useCallback((type: ProjectFile['type']) => {
     setNewFileType(type);
@@ -214,7 +227,7 @@ export default function FileExplorer({
       {/* Drop overlay */}
       <div className={`absolute inset-0 z-50 bg-muted/70 backdrop-blur-sm border-2 border-dashed border-muted-foreground/40 rounded-lg flex flex-col items-center justify-center gap-2 pointer-events-none transition-opacity duration-200 ease-in-out ${isDragOver ? 'opacity-100' : 'opacity-0'}`}>
         <Upload className="h-8 w-8 text-muted-foreground" />
-        <span className="text-sm font-medium text-muted-foreground">Drop .v or .xdc files</span>
+        <span className="text-sm font-medium text-muted-foreground">Drop .v, .xdc, or .txt/.mem files</span>
       </div>
 
       {/* Add file button */}
@@ -307,6 +320,25 @@ export default function FileExplorer({
                             <DropdownMenuItem onClick={() => handleDuplicate(file)}>
                               <Copy className="h-3.5 w-3.5 mr-2" /> Duplicate
                             </DropdownMenuItem>
+                            <DropdownMenuSub>
+                              <DropdownMenuSubTrigger>
+                                <FileText className="h-3.5 w-3.5 mr-2" /> Change Type
+                              </DropdownMenuSubTrigger>
+                              <DropdownMenuSubContent>
+                                {FILE_TYPE_OPTIONS.map(opt => (
+                                  <DropdownMenuItem
+                                    key={opt.value}
+                                    onClick={() => onSetFileType(file.id, opt.value)}
+                                    disabled={file.type === opt.value}
+                                  >
+                                    {opt.icon} {opt.label}
+                                    {file.type === opt.value && (
+                                      <span className="ml-auto text-[10px] text-muted-foreground">current</span>
+                                    )}
+                                  </DropdownMenuItem>
+                                ))}
+                              </DropdownMenuSubContent>
+                            </DropdownMenuSub>
                             {file.type === 'verilog' && (
                               <DropdownMenuItem onClick={() => {
                                 const match = file.content.match(/module\s+(\w+)/);
@@ -339,6 +371,25 @@ export default function FileExplorer({
                       <ContextMenuItem onClick={() => handleDuplicate(file)}>
                         <Copy className="h-3.5 w-3.5 mr-2" /> Duplicate
                       </ContextMenuItem>
+                      <ContextMenuSub>
+                        <ContextMenuSubTrigger>
+                          <FileText className="h-3.5 w-3.5 mr-2" /> Change Type
+                        </ContextMenuSubTrigger>
+                        <ContextMenuSubContent>
+                          {FILE_TYPE_OPTIONS.map(opt => (
+                            <ContextMenuItem
+                              key={opt.value}
+                              onClick={() => onSetFileType(file.id, opt.value)}
+                              disabled={file.type === opt.value}
+                            >
+                              {opt.icon} {opt.label}
+                              {file.type === opt.value && (
+                                <span className="ml-auto text-[10px] text-muted-foreground">current</span>
+                              )}
+                            </ContextMenuItem>
+                          ))}
+                        </ContextMenuSubContent>
+                      </ContextMenuSub>
                       {file.type === 'verilog' && (
                         <ContextMenuItem onClick={() => {
                           const match = file.content.match(/module\s+(\w+)/);

@@ -243,16 +243,44 @@ function parseAlwaysBlocks(body: string): VerilogAlwaysBlock[] {
         continue;
       }
     } else {
-      const semi = body.indexOf(';', afterHeader);
-      if (semi === -1) continue;
-      blockBody = body.slice(afterHeader, semi + 1);
-      headerRegex.lastIndex = semi + 1;
+      // Single-statement body. May contain nested begin/end (e.g. `always @(*) if (cond) begin ... end`).
+      // Walk characters until a top-level statement terminator (`;` outside any begin/end).
+      const end = findStatementEnd(body, afterHeader);
+      if (end === -1) continue;
+      blockBody = body.slice(afterHeader, end);
+      headerRegex.lastIndex = end;
     }
     const type = sensitivity.includes('posedge') || sensitivity.includes('negedge')
       ? 'sequential' : 'combinational';
     blocks.push({ sensitivity, body: blockBody.trim(), type });
   }
   return blocks;
+}
+
+// Find the end of a single procedural statement starting at `start`. Treats nested
+// begin/end as one balanced block, otherwise terminates at the first `;` at depth 0.
+// Returns the index just past the terminator (or past the matching `end`), or -1.
+function findStatementEnd(src: string, start: number): number {
+  let i = start;
+  // Skip leading whitespace
+  while (i < src.length && /\s/.test(src[i])) i++;
+  let depth = 0;
+  while (i < src.length) {
+    const rest = src.slice(i);
+    if (rest.match(/^\bbegin\b/)) { depth++; i += 5; continue; }
+    if (rest.match(/^\bend\b/)) {
+      if (depth > 0) {
+        depth--;
+        i += 3;
+        if (depth === 0) return i;
+        continue;
+      }
+      return i; // unbalanced — bail out
+    }
+    if (depth === 0 && src[i] === ';') return i + 1;
+    i++;
+  }
+  return -1;
 }
 
 function parseInitialBlocks(body: string): VerilogInitialBlock[] {

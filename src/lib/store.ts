@@ -35,6 +35,7 @@ export type ProjectAction =
   | { type: 'ADD_FILE'; file: ProjectFile }
   | { type: 'UPDATE_FILE'; id: string; content: string }
   | { type: 'RENAME_FILE'; id: string; name: string }
+  | { type: 'SET_FILE_TYPE'; id: string; fileType: ProjectFile['type'] }
   | { type: 'DELETE_FILE'; id: string }
   | { type: 'SET_ACTIVE_FILE'; id: string }
   | { type: 'OPEN_FILE'; id: string }
@@ -124,6 +125,14 @@ export function projectReducer(state: ProjectState, action: ProjectAction): Proj
         ),
       };
     }
+
+    case 'SET_FILE_TYPE':
+      return {
+        ...state,
+        files: state.files.map(f =>
+          f.id === action.id ? { ...f, type: action.fileType, updatedAt: Date.now() } : f
+        ),
+      };
 
     case 'DELETE_FILE': {
       const files = state.files.filter(f => f.id !== action.id);

@@ -333,10 +333,16 @@ export default function Home() {
     }
     addConsoleMsg('info', `Top module: ${topMod}`, 'Simulation');
 
+    // Include all files (incl. memory fixtures like testvectors_hex.txt) for $readmemh
+    const fileMap: Record<string, string> = {};
+    for (const file of state.files) {
+      fileMap[file.name] = file.content;
+    }
+
     // Use setTimeout to allow UI to update
     setTimeout(() => {
       try {
-        const result = simulate(sources, topMod, tbModuleName, 1000);
+        const result = simulate(sources, topMod, tbModuleName, 5000, fileMap);
 
         if (result.errors.length > 0) {
           for (const err of result.errors) {
@@ -345,12 +351,12 @@ export default function Home() {
         }
 
         for (const log of result.logs) {
-          addConsoleMsg('log', log, 'Simulation');
+          addConsoleMsg('log', `[${log.time}ns] ${log.message}`, 'Simulation');
         }
 
         setSimulationResult(result);
         addConsoleMsg('success',
-          `Simulation complete: ${result.waveform.length} samples, ${result.signals.length} signals, ${result.duration}ns`,
+          `Simulation complete: ${result.signals.length} signals, ${result.duration}ns`,
           'Simulation'
         );
         toast.success('Simulation complete', { description: `${result.signals.length} signals, ${result.duration}ns` });
@@ -618,6 +624,7 @@ export default function Home() {
               onAddFile={(file) => dispatch({ type: 'ADD_FILE', file })}
               onDeleteFile={(id) => dispatch({ type: 'DELETE_FILE', id })}
               onRenameFile={(id, name) => dispatch({ type: 'RENAME_FILE', id, name })}
+              onSetFileType={(id, fileType) => dispatch({ type: 'SET_FILE_TYPE', id, fileType })}
               onSetTopModule={(name) => {
                 dispatch({ type: 'SET_TOP_MODULE', name });
                 addConsoleMsg('info', `Top module set to: ${name}`, 'System');
