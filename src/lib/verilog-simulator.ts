@@ -13,7 +13,7 @@
 //   - initial / always (explicit list, posedge/negedge, *, no-sensitivity loops)
 //   - blocking and non-blocking assigns; concatenated LHS
 //   - if/else, case, for, repeat, while, begin/end
-//   - intra-statement delays (#N stmt;) and inter-statement delays (#N;)
+//   - intra-statement delays (#N stmt;) and inter-statement delays (#N;), with `timescale`
 //   - bit/range select (LHS and RHS), memory indexing (LHS and RHS)
 //   - 4-state ===, !==, x/z literals (x≡z)
 //   - reduction & unary ops, full binary op set, ternary
@@ -284,12 +284,72 @@ export interface SimulationResult {
   signalWidths?: Record<string, number>;
 }
 
+const TIME_UNIT_NS: Record<string, number> = {
+  s: 1_000_000_000,
+  ms: 1_000_000,
+  us: 1_000,
+  ns: 1,
+  ps: 0.001,
+  fs: 0.000001,
+};
+
+interface TimescaleDirective {
+  index: number;
+  timeUnitNs: number;
+}
+
+function parseTimescaleMagnitude(raw: string, unitRaw: string): number | null {
+  const mag = Number.parseFloat(raw);
+  const unit = TIME_UNIT_NS[unitRaw.toLowerCase()];
+  if (!Number.isFinite(mag) || unit === undefined) return null;
+  return mag * unit;
+}
+
+function findTimescaleDirectives(source: string): TimescaleDirective[] {
+  const out: TimescaleDirective[] = [];
+  const re = /`timescale\s+(\d+(?:\.\d+)?)\s*(s|ms|us|ns|ps|fs)\s*\/\s*\d+(?:\.\d+)?\s*(s|ms|us|ns|ps|fs)/ig;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const timeUnitNs = parseTimescaleMagnitude(m[1], m[2]);
+    if (timeUnitNs !== null) out.push({ index: m.index, timeUnitNs });
+  }
+  return out;
+}
+
+function detectTimeUnitNs(sources: Record<string, string>): number {
+  for (const source of Object.values(sources)) {
+    const first = findTimescaleDirectives(source)[0];
+    if (first) return first.timeUnitNs;
+  }
+  return 1;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function detectModuleTimeUnitNs(source: string, modules: VerilogModule[]): Map<string, number> {
+  const out = new Map<string, number>();
+  const directives = findTimescaleDirectives(source);
+  for (const mod of modules) {
+    const moduleMatch = new RegExp(`\\bmodule\\s+${escapeRegExp(mod.name)}\\b`).exec(source);
+    const moduleIndex = moduleMatch?.index ?? source.indexOf(mod.raw);
+    let timeUnitNs = 1;
+    for (const directive of directives) {
+      if (moduleIndex >= 0 && directive.index > moduleIndex) break;
+      timeUnitNs = directive.timeUnitNs;
+    }
+    out.set(mod.name, timeUnitNs);
+  }
+  return out;
+}
+
 // ============================================================
 // Expression AST
 // ============================================================
 
 type Expr =
-  | { kind: 'num'; w: number; val: V4 }
+  | { kind: 'num'; w: number; val: V4; raw?: string }
   | { kind: 'id'; name: string }
   | { kind: 'bit'; base: Expr; idx: Expr }
   | { kind: 'range'; base: Expr; msb: number; lsb: number }
@@ -358,10 +418,14 @@ function tokenize(src: string): Tok[] {
       i += sizedM[0].length;
       continue;
     }
-    // Plain integer
+    // Plain integer/decimal. Decimal values are mainly used by delays.
     if (/[0-9]/.test(c)) {
       let j = i;
       while (j < src.length && /[0-9_]/.test(src[j])) j++;
+      if (src[j] === '.' && /[0-9]/.test(src[j + 1] ?? '')) {
+        j++;
+        while (j < src.length && /[0-9_]/.test(src[j])) j++;
+      }
       toks.push({ type: 'num', value: src.slice(i, j), pos: i });
       i = j;
       continue;
@@ -552,7 +616,7 @@ class Parser {
   parsePrim(): Expr {
     const t = this.next();
     if (!t) throw new Error('Unexpected end of expression');
-    if (t.type === 'num') return { kind: 'num', ...parseNumberLit(t.value) };
+    if (t.type === 'num') return { kind: 'num', raw: t.value, ...parseNumberLit(t.value) };
     if (t.type === 'id') return { kind: 'id', name: t.value };
     if (t.type === 'sysid') {
       // System function call — only $time and similar take no args here
@@ -622,6 +686,41 @@ function exprConstInt(e: Expr, params = new Map<string, number>()): number | nul
   return null;
 }
 
+function exprConstNumber(e: Expr, params = new Map<string, number>()): number | null {
+  if (e.kind === 'num') {
+    if ((e.val.x & bmask(e.w)) !== 0n) return null;
+    if (e.raw && !e.raw.includes("'")) return Number.parseFloat(e.raw.replace(/_/g, ''));
+    return Number(e.val.v);
+  }
+  if (e.kind === 'id') return params.get(e.name) ?? null;
+  if (e.kind === 'unary' && e.op === '-') {
+    const v = exprConstNumber(e.arg, params); return v === null ? null : -v;
+  }
+  if (e.kind === 'unary' && e.op === '+') {
+    return exprConstNumber(e.arg, params);
+  }
+  if (e.kind === 'binary') {
+    const l = exprConstNumber(e.l, params);
+    const r = exprConstNumber(e.r, params);
+    if (l === null || r === null) return null;
+    switch (e.op) {
+      case '+': return l + r;
+      case '-': return l - r;
+      case '*': return l * r;
+      case '/': return r === 0 ? null : l / r;
+      case '%': return r === 0 ? null : l % r;
+      case '<<': return l << r;
+      case '>>': return l >> r;
+    }
+  }
+  if (e.kind === 'ternary') {
+    const c = exprConstNumber(e.c, params);
+    if (c === null) return null;
+    return exprConstNumber(c !== 0 ? e.t : e.f, params);
+  }
+  return null;
+}
+
 function parseNumberLit(s: string): { w: number; val: V4 } {
   // sized: 32'h1234, 4'bxxxx, 100'h00...
   const m = s.match(/^(\d+)?'([sS]?)([bBoOdDhH])([0-9a-fA-FxXzZ_?]+)$/);
@@ -652,22 +751,79 @@ function parseNumberLit(s: string): { w: number; val: V4 } {
   return { w: 32, val: { v: BigInt(n) & bmask(32), x: 0n } };
 }
 
+function parseDelayNumber(raw: string): number {
+  if (raw.includes("'")) {
+    const n = parseNumberLit(raw);
+    if ((n.val.x & bmask(n.w)) !== 0n) throw new Error('Delay literal cannot contain x/z bits');
+    return Number(n.val.v);
+  }
+  return Number.parseFloat(raw.replace(/_/g, ''));
+}
+
+function applyDelayUnit(value: number, explicitUnit: string | undefined, timeUnitNs: number): number {
+  const multiplier = explicitUnit ? TIME_UNIT_NS[explicitUnit.toLowerCase()] : timeUnitNs;
+  if (multiplier === undefined || !Number.isFinite(value)) throw new Error('Invalid delay value');
+  return value * multiplier;
+}
+
+function parseDelayValue(p: Parser, params: Map<string, number>, timeUnitNs: number): number {
+  if (p.match('op', '(')) {
+    if (p.peek()?.type === 'num' && p.peek(1)?.type === 'id' && TIME_UNIT_NS[p.peek(1)!.value.toLowerCase()] !== undefined && p.peek(2)?.value === ')') {
+      const value = parseDelayNumber(p.next()!.value);
+      const unit = p.next()!.value;
+      p.expect('op', ')');
+      return applyDelayUnit(value, unit, timeUnitNs);
+    }
+    const min = p.parseExpr();
+    let selected = min;
+    if (p.match('op', ':')) {
+      selected = p.parseExpr(); // min:typ:max delays use typ in this simulator.
+      if (p.match('op', ':')) p.parseExpr();
+    }
+    p.expect('op', ')');
+    const value = exprConstNumber(selected, params);
+    if (value === null) throw new Error('Delay expression must be constant or parameter-based');
+    return applyDelayUnit(value, undefined, timeUnitNs);
+  }
+
+  if (p.peek()?.type === 'num') {
+    const value = parseDelayNumber(p.next()!.value);
+    const unitTok = p.peek();
+    const unit = unitTok?.type === 'id' && TIME_UNIT_NS[unitTok.value.toLowerCase()] !== undefined
+      ? p.next()!.value
+      : undefined;
+    return applyDelayUnit(value, unit, timeUnitNs);
+  }
+
+  const expr = p.parseExpr();
+  const value = exprConstNumber(expr, params);
+  if (value === null) throw new Error('Delay expression must be constant or parameter-based');
+  return applyDelayUnit(value, undefined, timeUnitNs);
+}
+
+function parseDelayString(raw: string | undefined, params: Map<string, number>, timeUnitNs: number): number | undefined {
+  if (!raw) return undefined;
+  const p = new Parser(tokenize(`#${raw}`));
+  p.expect('op', '#');
+  return parseDelayValue(p, params, timeUnitNs);
+}
+
 // ============================================================
 // Statement parser
 // ============================================================
 
-function parseStatementsFromString(src: string, params = new Map<string, number>()): Stmt[] {
+function parseStatementsFromString(src: string, params = new Map<string, number>(), timeUnitNs = 1): Stmt[] {
   const toks = tokenize(src);
   const p = new Parser(toks);
   const stmts: Stmt[] = [];
   while (!p.eof()) {
-    const s = parseStmt(p, params);
+    const s = parseStmt(p, params, timeUnitNs);
     if (s) stmts.push(s);
   }
   return stmts;
 }
 
-function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
+function parseStmt(p: Parser, params = new Map<string, number>(), timeUnitNs = 1): Stmt | null {
   const t = p.peek();
   if (!t) return null;
 
@@ -678,7 +834,7 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
     p.next();
     const body: Stmt[] = [];
     while (!p.eof() && !p.check('end')) {
-      const s = parseStmt(p, params); if (s) body.push(s);
+      const s = parseStmt(p, params, timeUnitNs); if (s) body.push(s);
     }
     p.expect('end');
     return { kind: 'block', body };
@@ -689,11 +845,11 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
     p.expect('op', '(');
     const cond = p.parseExpr();
     p.expect('op', ')');
-    const thenS = parseStmt(p, params) ?? { kind: 'block', body: [] };
+    const thenS = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
     let elseS: Stmt | undefined;
     if (p.check('else')) {
       p.next();
-      elseS = parseStmt(p, params) ?? { kind: 'block', body: [] };
+      elseS = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
     }
     return { kind: 'if', cond, then: thenS, else: elseS };
   }
@@ -708,13 +864,13 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
     while (!p.eof() && !p.check('id', 'endcase') && p.peek()?.value !== 'endcase') {
       if (p.check('default')) {
         p.next(); p.match('op', ':');
-        const body = parseStmt(p, params) ?? { kind: 'block', body: [] };
+        const body = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
         items.push({ labels: 'default', body });
       } else {
         const labels: Expr[] = [p.parseExpr()];
         while (p.match('op', ',')) labels.push(p.parseExpr());
         p.expect('op', ':');
-        const body = parseStmt(p, params) ?? { kind: 'block', body: [] };
+        const body = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
         items.push({ labels, body });
       }
     }
@@ -726,13 +882,13 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
   if (t.type === 'for') {
     p.next();
     p.expect('op', '(');
-    const init = parseSimpleStmt(p, params);
+    const init = parseSimpleStmt(p, params, timeUnitNs);
     p.match('op', ';');
     const cond = p.parseExpr();
     p.expect('op', ';');
-    const step = parseSimpleStmt(p, params);
+    const step = parseSimpleStmt(p, params, timeUnitNs);
     p.expect('op', ')');
-    const body = parseStmt(p, params) ?? { kind: 'block', body: [] };
+    const body = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
     return { kind: 'for', init: init ?? { kind: 'block', body: [] }, cond, step: step ?? { kind: 'block', body: [] }, body };
   }
 
@@ -741,7 +897,7 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
     p.expect('op', '(');
     const cond = p.parseExpr();
     p.expect('op', ')');
-    const body = parseStmt(p, params) ?? { kind: 'block', body: [] };
+    const body = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
     return { kind: 'while', cond, body };
   }
 
@@ -750,22 +906,21 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
     p.expect('op', '(');
     const count = p.parseExpr();
     p.expect('op', ')');
-    const body = parseStmt(p, params) ?? { kind: 'block', body: [] };
+    const body = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
     return { kind: 'repeat', count, body };
   }
 
   if (t.type === 'forever') {
     p.next();
-    const body = parseStmt(p, params) ?? { kind: 'block', body: [] };
+    const body = parseStmt(p, params, timeUnitNs) ?? { kind: 'block', body: [] };
     return { kind: 'forever', body };
   }
 
   if (t.type === 'op' && t.value === '#') {
     p.next();
-    const numTok = p.expect('num');
-    const ns = parseInt(numTok.value, 10);
+    const ns = parseDelayValue(p, params, timeUnitNs);
     if (p.match('op', ';')) return { kind: 'delay', ns };
-    const inner = parseStmt(p, params) ?? undefined;
+    const inner = parseStmt(p, params, timeUnitNs) ?? undefined;
     return { kind: 'delay', ns, inner };
   }
 
@@ -773,7 +928,7 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
     p.next();
     const sens = parseSensitivity(p);
     if (p.match('op', ';')) return { kind: 'eventCtrl', sens };
-    const inner = parseStmt(p, params) ?? undefined;
+    const inner = parseStmt(p, params, timeUnitNs) ?? undefined;
     return { kind: 'eventCtrl', sens, inner };
   }
 
@@ -794,18 +949,18 @@ function parseStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
   }
 
   // Statement starting with identifier → assignment
-  return parseAssignStmt(p, params);
+  return parseAssignStmt(p, params, timeUnitNs);
 }
 
-function parseSimpleStmt(p: Parser, params = new Map<string, number>()): Stmt | null {
+function parseSimpleStmt(p: Parser, params = new Map<string, number>(), timeUnitNs = 1): Stmt | null {
   // Used inside for(...) — disallows trailing ';'
   const t = p.peek();
   if (!t) return null;
   if (t.type === 'op' && t.value === ';') return null;
-  return parseAssignStmt(p, params, /*requireSemi=*/false);
+  return parseAssignStmt(p, params, timeUnitNs, /*requireSemi=*/false);
 }
 
-function parseAssignStmt(p: Parser, params = new Map<string, number>(), requireSemi = true): Stmt | null {
+function parseAssignStmt(p: Parser, params = new Map<string, number>(), timeUnitNs = 1, requireSemi = true): Stmt | null {
   const lhs = parseLValue(p, params);
   if (!lhs) return null;
   const opTok = p.peek();
@@ -821,8 +976,7 @@ function parseAssignStmt(p: Parser, params = new Map<string, number>(), requireS
   // intra-assignment delay: signal = #5 expr;
   let delay: number | undefined;
   if (p.match('op', '#')) {
-    const delayTok = p.expect('num');
-    delay = parseInt(delayTok.value, 10);
+    delay = parseDelayValue(p, params, timeUnitNs);
   }
 
   const expr = p.parseExpr();
@@ -1084,6 +1238,8 @@ class SimContext {
   logs: SimulationLog[] = [];
   fileMap: Record<string, string> = {};
   duration = 0;
+  timeUnitNs = 1;
+  moduleTimeUnitNs = new Map<string, number>();
 
   resolveSignal(scope: ScopeData, name: string): Signal | undefined {
     return scope.signals.get(name);
@@ -1092,6 +1248,18 @@ class SimContext {
   resolveMemory(scope: ScopeData, name: string): MemoryStore | undefined {
     return scope.memories.get(name);
   }
+}
+
+function timeUnitForScope(scope: ScopeData, ctx: SimContext): number {
+  return ctx.moduleTimeUnitNs.get(scope.mod.name) ?? ctx.timeUnitNs;
+}
+
+function currentTimeInUnits(scope: ScopeData, ctx: SimContext): number {
+  return ctx.scheduler.now / timeUnitForScope(scope, ctx);
+}
+
+function formatTimeValue(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(12)));
 }
 
 // ============================================================
@@ -1226,7 +1394,7 @@ function evalExpr(e: Expr, scope: ScopeData, ctx: SimContext): { val: V4; w: num
     }
     case 'sysfunc': {
       if (e.name === '$time' || e.name === '$stime' || e.name === '$realtime') {
-        return { val: v4FromBig(BigInt(ctx.scheduler.now), 32), w: 32 };
+        return { val: v4FromBig(BigInt(Math.trunc(currentTimeInUnits(scope, ctx))), 32), w: 32 };
       }
       return { val: v4Zero(), w: 32 };
     }
@@ -1376,7 +1544,7 @@ function* execStmt(s: Stmt, scope: ScopeData, ctx: SimContext): Generator<Yield,
       return;
     case 'assign': {
       const r = evalExpr(s.expr, scope, ctx);
-      if (s.delay !== undefined && s.delay > 0) {
+      if (s.delay !== undefined) {
         const valSnap = r.val, wSnap = r.w, lvSnap = s.target;
         if (s.nonblocking) {
           ctx.scheduler.schedule(ctx.scheduler.now + s.delay, 1, () => {
@@ -1571,7 +1739,7 @@ function formatDisplayArgs(args: (Expr | { kind: 'str'; value: string })[], scop
           case 'd': out += v4FormatDec(valR.val, valR.w); break;
           case 'h': case 'x': out += v4FormatHex(valR.val, valR.w); break;
           case 'b': out += v4FormatBin(valR.val, valR.w); break;
-          case 't': out += String(ctx.scheduler.now); break;
+          case 't': out += formatTimeValue(currentTimeInUnits(scope, ctx)); break;
           case 's': out += a && (a as { kind: string }).kind === 'str' ? (a as { kind: 'str'; value: string }).value : v4FormatDec(valR.val, valR.w); break;
           case 'm': out += scope.path; break;
           case '%': out += '%'; break;
@@ -1668,12 +1836,18 @@ function runProcess(make: () => Generator<Yield, void, void>, scope: ScopeData, 
 }
 
 // Continuous-assign style: re-evaluate `expr` and write `target` whenever any RHS signal changes
-function bindContinuous(target: LValue, expr: Expr, scope: ScopeData, ctx: SimContext): void {
+function bindContinuous(target: LValue, expr: Expr, scope: ScopeData, ctx: SimContext, delay?: number): void {
   const reads = new Set<string>();
   collectReadSignals(expr, reads);
+  let version = 0;
   const evalAndWrite = () => {
     const r = evalExpr(expr, scope, ctx);
-    writeLValue(target, r.val, r.w, scope, ctx);
+    const localVersion = ++version;
+    const commit = () => {
+      if (localVersion === version) writeLValue(target, r.val, r.w, scope, ctx);
+    };
+    if (delay !== undefined) ctx.scheduler.schedule(ctx.scheduler.now + delay, 0, commit);
+    else commit();
   };
   // Also need RHS for index-bearing LValues? We treat target as simple here.
   // Also for indexed LHS like x[i] = y, the i would need to be in the read set too.
@@ -1829,6 +2003,7 @@ function elaborate(
 
   function compileScope(sc: ScopeData): void {
     const mod = sc.mod;
+    const timeUnitNs = ctx.moduleTimeUnitNs.get(mod.name) ?? ctx.timeUnitNs;
 
     // Continuous assigns
     for (const a of mod.assigns) {
@@ -1836,7 +2011,7 @@ function elaborate(
         const exprAst = new Parser(tokenize(a.expression)).parseExpr();
         const target = parseLValue(new Parser(tokenize(a.targetRaw ?? a.target)), sc.params);
         if (!target) throw new Error(`invalid assignment target "${a.targetRaw ?? a.target}"`);
-        bindContinuous(target, exprAst, sc, ctx);
+        bindContinuous(target, exprAst, sc, ctx, parseDelayString(a.delay, sc.params, timeUnitNs));
       } catch (err) {
         ctx.errors.push(`assign in ${sc.path}: ${(err as Error).message}`);
       }
@@ -1847,7 +2022,7 @@ function elaborate(
       try {
         const target = parseLValue(new Parser(tokenize(gp.output)), sc.params);
         const exprAst = gatePrimitiveExpr(gp.gate, gp.inputs);
-        if (target && exprAst) bindContinuous(target, exprAst, sc, ctx);
+        if (target && exprAst) bindContinuous(target, exprAst, sc, ctx, parseDelayString(gp.delay, sc.params, timeUnitNs));
       } catch (err) {
         ctx.errors.push(`gate primitive in ${sc.path}: ${(err as Error).message}`);
       }
@@ -1856,7 +2031,7 @@ function elaborate(
     // Initial blocks
     for (const ib of mod.initialBlocks) {
       try {
-        const stmts = parseStatementsFromString(ib.body, sc.params);
+        const stmts = parseStatementsFromString(ib.body, sc.params, timeUnitNs);
         runProcess(() => execBlock(stmts, sc, ctx), sc, ctx, false);
       } catch (err) {
         ctx.errors.push(`initial in ${sc.path}: ${(err as Error).message}`);
@@ -1866,7 +2041,7 @@ function elaborate(
     // Always blocks (with @(...) sensitivity)
     for (const ab of mod.alwaysBlocks) {
       try {
-        const stmts = parseStatementsFromString(ab.body, sc.params);
+        const stmts = parseStatementsFromString(ab.body, sc.params, timeUnitNs);
         const sens = parseSensitivityFromString(ab.sensitivity);
         bindAlways(stmts, sens, sc, ctx);
       } catch (err) {
@@ -1877,7 +2052,7 @@ function elaborate(
     // Always blocks WITHOUT sensitivity (clock generators etc.)
     for (const body of findUnsensitizedAlways(mod.raw)) {
       try {
-        const stmts = parseStatementsFromString(body, sc.params);
+        const stmts = parseStatementsFromString(body, sc.params, timeUnitNs);
         // Wrap in forever-loop semantics: such a block runs forever, restarting at end
         const make = function* (): Generator<Yield, void, void> {
           yield* execBlock(stmts, sc, ctx);
@@ -2010,15 +2185,21 @@ export function simulate(
   files: Record<string, string> = {},
 ): SimulationResult {
   const allModules: VerilogModule[] = [];
+  const moduleTimeUnitNs = new Map<string, number>();
   const errors: string[] = [];
   for (const [filename, source] of Object.entries(sources)) {
     const r = parseVerilog(source);
     if (r.errors.length > 0) for (const e of r.errors) errors.push(`${filename}: ${e}`);
+    for (const [moduleName, timeUnitNs] of detectModuleTimeUnitNs(source, r.modules)) {
+      moduleTimeUnitNs.set(moduleName, timeUnitNs);
+    }
     allModules.push(...r.modules);
   }
 
   const ctx = new SimContext();
   ctx.fileMap = { ...sources, ...files };
+  ctx.timeUnitNs = detectTimeUnitNs(sources);
+  ctx.moduleTimeUnitNs = moduleTimeUnitNs;
   ctx.scheduler.maxTime = maxTimeNs;
   CURRENT_SCHED = ctx.scheduler;
 

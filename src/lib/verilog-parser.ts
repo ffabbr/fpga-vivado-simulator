@@ -21,6 +21,7 @@ export interface VerilogAssign {
   targetMsb?: number;
   targetLsb?: number;
   expression: string;
+  delay?: string;
 }
 
 export interface VerilogAlwaysBlock {
@@ -57,6 +58,7 @@ export interface VerilogInstance {
 export interface VerilogGatePrimitive {
   gate: string;           // "and", "or", "xor", "not", "nand", "nor", "xnor", "buf"
   instanceName?: string;  // optional instance name
+  delay?: string;
   output: string;         // first arg is output
   inputs: string[];       // remaining args are inputs
 }
@@ -306,15 +308,17 @@ function parseRegs(body: string, params: Map<string, number>): VerilogReg[] {
 
 function parseAssigns(body: string): VerilogAssign[] {
   const assigns: VerilogAssign[] = [];
-  const regex = /\bassign\s+(.+?)\s*=\s*([^;]+);/g;
+  const regex = /\bassign\s+(?:(#\s*(?:\([^)]*\)|\S+))\s*)?(.+?)\s*=\s*([^;]+);/g;
   let match;
   while ((match = regex.exec(body)) !== null) {
-    const targetRaw = match[1].trim();
+    const delay = match[1]?.replace(/^#\s*/, '').trim();
+    const targetRaw = match[2].trim();
     const targetMatch = targetRaw.match(/^(\w+)(\[\d+(?::\d+)?\])?$/);
     const assign: VerilogAssign = {
       target: targetMatch?.[1] ?? targetRaw,
       targetRaw,
-      expression: match[2].trim(),
+      expression: match[3].trim(),
+      delay,
     };
     if (targetMatch?.[2]) {
       const bitMatch = targetMatch[2].match(/\[(\d+)(?::(\d+))?\]/);
@@ -480,18 +484,20 @@ const GATE_PRIMITIVES = new Set([
 
 function parseGatePrimitives(body: string): VerilogGatePrimitive[] {
   const primitives: VerilogGatePrimitive[] = [];
-  // Match: gate_type [instance_name] ( output, input1, input2, ... );
+  // Match: gate_type [#delay] [instance_name] ( output, input1, input2, ... );
   // The instance name is optional. Args are comma-separated identifiers.
-  const regex = /\b(and|or|xor|not|nand|nor|xnor|buf)\s*(?:(\w+)\s*)?\(\s*([^)]+)\)\s*;/g;
+  const regex = /\b(and|or|xor|not|nand|nor|xnor|buf)\s*(?:(#\s*(?:\([^)]*\)|\S+))\s*)?(?:(\w+)\s*)?\(\s*([^)]+)\)\s*;/g;
   let match;
   while ((match = regex.exec(body)) !== null) {
     const gate = match[1];
-    const instanceName = match[2] || undefined;
-    const args = match[3].split(',').map(s => s.trim()).filter(Boolean);
+    const delay = match[2]?.replace(/^#\s*/, '').trim();
+    const instanceName = match[3] || undefined;
+    const args = match[4].split(',').map(s => s.trim()).filter(Boolean);
     if (args.length < 2) continue;
     primitives.push({
       gate,
       instanceName,
+      delay,
       output: args[0],
       inputs: args.slice(1),
     });
