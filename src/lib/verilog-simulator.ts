@@ -1237,19 +1237,40 @@ interface SchedEvent {
   fn: () => void;
 }
 
+class SimulationLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SimulationLimitError';
+  }
+}
+
+const MAX_SCHEDULER_EVENTS = 1_000_000;
+const MAX_SAME_TIME_EVENTS = 100_000;
+const MAX_PROCESS_STEPS_WITHOUT_YIELD = 100_000;
+
 class Scheduler {
   events: SchedEvent[] = [];
   now = 0;
   seqCounter = 0;
   finished = false;
   maxTime = 100000;
+  maxEvents = MAX_SCHEDULER_EVENTS;
+  maxSameTimeEvents = MAX_SAME_TIME_EVENTS;
 
   schedule(time: number, region: 0 | 1, fn: () => void): void {
     this.events.push({ time, region, seq: this.seqCounter++, fn });
   }
 
   run(): void {
+    let processedEvents = 0;
+    let sameTimeEvents = 0;
+    let lastTime: number | null = null;
+
     while (!this.finished && this.events.length > 0) {
+      if (++processedEvents > this.maxEvents) {
+        throw new SimulationLimitError(`Simulation stopped after ${this.maxEvents} scheduled events without finishing`);
+      }
+
       // Pop the earliest event by (time, region, seq)
       let bestIdx = 0;
       for (let i = 1; i < this.events.length; i++) {
@@ -1263,6 +1284,15 @@ class Scheduler {
       this.events.splice(bestIdx, 1);
       if (e.time > this.maxTime) { this.now = this.maxTime; break; }
       this.now = e.time;
+      if (lastTime === e.time) {
+        sameTimeEvents++;
+        if (sameTimeEvents > this.maxSameTimeEvents) {
+          throw new SimulationLimitError(`Simulation stopped after ${this.maxSameTimeEvents} zero-delay events at ${e.time}ns`);
+        }
+      } else {
+        lastTime = e.time;
+        sameTimeEvents = 1;
+      }
       try { e.fn(); } catch (err) {
         if (err instanceof FinishSignal) { this.finished = true; break; }
         throw err;
@@ -1864,10 +1894,16 @@ function formatDisplayArgs(args: (Expr | { kind: 'str'; value: string })[], scop
 function runProcess(make: () => Generator<Yield, void, void>, scope: ScopeData, ctx: SimContext, restartOnFinish: boolean): void {
   let gen = make();
   const pump = (): void => {
+    let stepsWithoutYield = 0;
     while (true) {
+      if (++stepsWithoutYield > MAX_PROCESS_STEPS_WITHOUT_YIELD) {
+        throw new SimulationLimitError(`Process in ${scope.path} stopped after ${MAX_PROCESS_STEPS_WITHOUT_YIELD} steps without a timing control`);
+      }
+
       let r;
       try { r = gen.next(); } catch (err) {
         if (err instanceof FinishSignal) throw err;
+        if (err instanceof SimulationLimitError) throw err;
         ctx.errors.push(`Runtime error: ${(err as Error).message}`);
         return;
       }
