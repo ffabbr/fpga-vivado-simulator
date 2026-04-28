@@ -62,6 +62,23 @@ function detectLikelyTopModule(verilogFiles: ProjectFile[]): string | null {
   return uniqueModuleNames[0];
 }
 
+function stripVerilogComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+}
+
+function detectLikelyFadeLogic(verilogFiles: ProjectFile[]): boolean {
+  return verilogFiles.some(file => {
+    const source = stripVerilogComments(file.content);
+    const hasFadeTerms = /\b(?:fade|brightness|pwm|duty|dim(?:mer)?|dim_led)\b/i.test(source);
+    const hasSequentialCounters = /\b(?:always_ff|always)\s*@[\s\S]*?\b(?:posedge|negedge)\b/i.test(source)
+      && /\b\w*(?:counter|count|brightness|fade)\w*\s*<=\s*\w*(?:counter|count|brightness|fade)\w*\s*\+/i.test(source);
+    const hasPwmCompare = /\b\w*(?:pwm|counter|count)\w*\s*<\s*\w*(?:brightness|duty|level|threshold)\w*/i.test(source);
+    return hasFadeTerms && (hasSequentialCounters || hasPwmCompare);
+  });
+}
+
 export default function Home() {
   const [state, dispatch] = useReducer(projectReducer, null, () => {
     return createEmptyProject();
@@ -89,6 +106,8 @@ export default function Home() {
   const [isMobile, setIsMobile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const yosysClientRef = useRef<YosysClient | null>(null);
+  const fadeWarningKeyRef = useRef<string | null>(null);
+  const waveformAutoRunKeyRef = useRef<string | null>(null);
 
   // Load from localStorage on mount + detect mobile by viewport width
   useEffect(() => {
@@ -123,6 +142,10 @@ export default function Home() {
       .filter(f => f.type === 'verilog')
       .map(f => f.content)
       .join('\0');
+  }, [state.files]);
+
+  const hasLikelyFadeLogic = useMemo(() => {
+    return detectLikelyFadeLogic(state.files.filter(f => f.type === 'verilog'));
   }, [state.files]);
 
   useEffect(() => {
@@ -282,8 +305,20 @@ export default function Home() {
     }
   }, [activeView]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Warn when board view is rendering source-level PWM/fade behavior.
+  useEffect(() => {
+    if (activeView !== 'board' || !loaded || !hasLikelyFadeLogic) return;
+    if (fadeWarningKeyRef.current === verilogContentKey) return;
+
+    fadeWarningKeyRef.current = verilogContentKey;
+    toast.warning('Experimental fade visualization', {
+      description: 'Board support for Verilog PWM/fading LEDs is experimental; displayed brightness is an approximation.',
+    });
+  }, [activeView, loaded, hasLikelyFadeLogic, verilogContentKey]);
+
   // Run simulation
-  const handleRunSimulation = useCallback(() => {
+  const handleRunSimulation = useCallback((options?: { switchBottomTab?: boolean }) => {
+    const switchBottomTab = options?.switchBottomTab ?? true;
     setIsSimulating(true);
     addConsoleMsg('info', 'Starting behavioral simulation...', 'Simulation');
 
@@ -361,8 +396,9 @@ export default function Home() {
         );
         toast.success('Simulation complete', { description: `${result.signals.length} signals, ${result.duration}ns` });
 
-        // Switch to waveform view
-        setBottomTab('waveform');
+        if (switchBottomTab) {
+          setBottomTab('waveform');
+        }
 
       } catch (err) {
         addConsoleMsg('error', `Simulation error: ${(err as Error).message}`, 'Simulation');
@@ -372,6 +408,15 @@ export default function Home() {
       }
     }, 50);
   }, [state.files, state.topModule, addConsoleMsg]);
+
+  // Auto-run when opening waveform view without current simulation data.
+  useEffect(() => {
+    if (activeView !== 'waveform' || !loaded || simulationResult || isSimulating) return;
+    if (waveformAutoRunKeyRef.current === verilogContentKey) return;
+
+    waveformAutoRunKeyRef.current = verilogContentKey;
+    handleRunSimulation({ switchBottomTab: false });
+  }, [activeView, loaded, simulationResult, isSimulating, verilogContentKey, handleRunSimulation]);
 
   const handleStopSimulation = useCallback(() => {
     setIsSimulating(false);

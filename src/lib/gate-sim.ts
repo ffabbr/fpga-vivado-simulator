@@ -30,6 +30,13 @@ interface YosysNetname {
   hide_name?: number;
 }
 
+interface PwmGroup {
+  pwmDFFs: number[];
+  fadeDFFs: number[];
+  brightnessDFFs: number[];
+  outNet: number;
+}
+
 // ─── Unified DFF config ───
 
 interface DFFConfig {
@@ -203,6 +210,10 @@ export class GateLevelSimulator {
   private ctrVal = 0;
   private ctrRstNet = -1;
   private ctrRstHigh = true;
+
+  // Recognized PWM fade helper registers, used only to preserve visible board
+  // behavior when a large clock divider is fast-forwarded.
+  private pwmGroups: PwmGroup[] = [];
 
   // Watched output port name (for FSM early-break detection)
   private _watchedPortName = '';
@@ -379,7 +390,8 @@ export class GateLevelSimulator {
     }
 
     // ── Detect counters for fast-forward ──
-    this.detectCounter();
+    this.detectCounter(mod);
+    this.detectPwmGroups(mod);
 
     // ── Pre-compute watched output port for change detection ──
     for (const port of this.outPorts) {
@@ -393,11 +405,41 @@ export class GateLevelSimulator {
   }
 
   // ─── Counter detection ───
-  // Finds sync-reset DFF groups that form binary counters.
+  // Finds DFF groups that form binary counters.
   // Determines actual bit ordering empirically (Yosys net IDs don't
   // correspond to bit positions) by setting counter to 2^k-1 and
   // simulating one cycle to identify which DFF becomes bit k.
-  private detectCounter() {
+  private detectCounter(mod: YosysModule) {
+    const qToDff = new Map<number, number>();
+    for (let i = 0; i < this.dLen; i++) {
+      if (this.dQ[i].length === 1) qToDff.set(this.dQ[i][0], i);
+    }
+
+    // Prefer explicit counter net names. Yosys often emits async-reset
+    // counters as one large reset group with unrelated FSM/PWM flops, so
+    // reset grouping alone cannot find dividers such as slow_clock.clk_count.
+    const namedCandidates: number[][] = [];
+    for (const [name, net] of Object.entries(mod.netnames)) {
+      if (net.bits.length < 3 || !/(?:^|[.\\])[\w$]*(?:count|counter)[\w$]*$/i.test(name)) continue;
+
+      const dffs: number[] = [];
+      let valid = true;
+      for (const bit of net.bits) {
+        if (typeof bit !== 'number') { valid = false; break; }
+        const dff = qToDff.get(bit);
+        if (dff === undefined) { valid = false; break; }
+        const cfg = this.dCfg[dff];
+        if (cfg.hasEnable || this.dQ[dff].length !== 1) { valid = false; break; }
+        dffs.push(dff);
+      }
+      if (valid) namedCandidates.push(dffs);
+    }
+
+    namedCandidates.sort((a, b) => b.length - a.length);
+    for (const dffs of namedCandidates) {
+      if (this.tryInstallCounter(dffs)) return;
+    }
+
     // Group 1-bit sync-reset DFFs (no enable, no async reset) by reset net
     const groups = new Map<number, number[]>();
     for (let i = 0; i < this.dLen; i++) {
@@ -413,88 +455,148 @@ export class GateLevelSimulator {
 
     for (const [rNet, dffs] of groups) {
       if (dffs.length < 3) continue; // skip tiny counters
+      if (this.tryInstallCounter(dffs, rNet)) return;
+    }
+  }
 
-      const savedStates = this.dState.slice();
-      const savedClk = this.prevClk;
-      const n = dffs.length;
+  private tryInstallCounter(dffs: number[], resetNet?: number): boolean {
+    if (dffs.length < 3 || dffs.length > 30) return false;
 
-      const zeroIn: Record<string, number> = {};
-      for (const p of this.inPorts) zeroIn[p.name] = 0;
+    const savedStates = this.dState.slice();
+    const savedClk = this.prevClk;
+    const n = dffs.length;
 
-      // Helper: simulate one rising+falling edge
-      const tickOnce = () => {
-        this.prevClk = 0;
-        zeroIn[this.clockPortName ?? 'clk'] = 1;
-        this.evaluateInternal(zeroIn);
-        zeroIn[this.clockPortName ?? 'clk'] = 0;
-        this.evaluateInternal(zeroIn);
-      };
+    const zeroIn: Record<string, number> = {};
+    for (const p of this.inPorts) zeroIn[p.name] = 0;
 
-      // Step 1: Find bit 0 — set all DFFs to 0, simulate 1 cycle
-      for (const i of dffs) this.dState[i] = 0;
-      tickOnce();
+    // Helper: simulate one rising+falling edge
+    const tickOnce = () => {
+      this.prevClk = 0;
+      zeroIn[this.clockPortName ?? 'clk'] = 1;
+      this.evaluateInternal(zeroIn);
+      zeroIn[this.clockPortName ?? 'clk'] = 0;
+      this.evaluateInternal(zeroIn);
+    };
 
-      const bitOrder: number[] = new Array(n);
-      const assigned = new Set<number>();
-      let valid = true;
-      let count1 = 0;
+    // Step 1: Find bit 0 — set all DFFs to 0, simulate 1 cycle
+    for (const i of dffs) this.dState[i] = 0;
+    tickOnce();
 
-      for (const i of dffs) {
-        if (this.dState[i] === 1) { bitOrder[0] = i; assigned.add(i); count1++; }
-      }
-      if (count1 !== 1) valid = false;
+    const bitOrder: number[] = new Array(n);
+    const assigned = new Set<number>();
+    let valid = true;
+    let count1 = 0;
 
-      // Step 2: For each bit k=1..n-1, set counter to (2^k)-1 and simulate 1 cycle.
-      // The carry ripples through bits 0..k-1, producing 2^k (only bit k set).
-      if (valid) {
-        for (let k = 1; k < n; k++) {
-          for (const i of dffs) this.dState[i] = 0;
-          for (let b = 0; b < k; b++) this.dState[bitOrder[b]] = 1;
-          tickOnce();
+    for (const i of dffs) {
+      if (this.dState[i] === 1) { bitOrder[0] = i; assigned.add(i); count1++; }
+    }
+    if (count1 !== 1) valid = false;
 
-          // Find the single newly-set DFF — that's bit k
-          let bitK = -1;
-          for (const i of dffs) {
-            if (this.dState[i] === 1 && !assigned.has(i)) {
-              if (bitK !== -1) { valid = false; break; } // multiple new bits set
-              bitK = i;
-            } else if (this.dState[i] === 1 && assigned.has(i)) {
-              valid = false; break; // a lower bit didn't clear — not a binary counter
-            }
-          }
-          if (!valid || bitK === -1) { valid = false; break; }
-          bitOrder[k] = bitK;
-          assigned.add(bitK);
-        }
-      }
-
-      // Step 3: Verify with 4 cycles using the discovered bit ordering
-      if (valid && assigned.size === n) {
+    // Step 2: For each bit k=1..n-1, set counter to (2^k)-1 and simulate 1 cycle.
+    // The carry ripples through bits 0..k-1, producing 2^k (only bit k set).
+    if (valid) {
+      for (let k = 1; k < n; k++) {
         for (const i of dffs) this.dState[i] = 0;
-        const vals: number[] = [0];
-        for (let cyc = 0; cyc < 4; cyc++) {
-          tickOnce();
-          let v = 0;
-          for (let b = 0; b < n; b++) v |= (this.dState[bitOrder[b]] << b);
-          vals.push(v);
+        for (let b = 0; b < k; b++) this.dState[bitOrder[b]] = 1;
+        tickOnce();
+
+        // Find the single newly-set DFF — that's bit k
+        let bitK = -1;
+        for (const i of dffs) {
+          if (this.dState[i] === 1 && !assigned.has(i)) {
+            if (bitK !== -1) { valid = false; break; } // multiple new bits set
+            bitK = i;
+          } else if (this.dState[i] === 1 && assigned.has(i)) {
+            valid = false; break; // a lower bit didn't clear — not a binary counter
+          }
         }
-        valid = vals[1] === 1 && vals[2] === 2 && vals[3] === 3 && vals[4] === 4;
-      }
-
-      // Restore state
-      for (let i = 0; i < this.dState.length; i++) this.dState[i] = savedStates[i];
-      this.prevClk = savedClk;
-
-      if (valid) {
-        this.ctrDFFs = bitOrder;
-        this.ctrPeriod = 1 << n;
-        this.ctrRstNet = rNet;
-        this.ctrRstHigh = this.dCfg[dffs[0]].syncResetActiveHigh;
-        this.ctrVal = 0;
-        for (let b = 0; b < n; b++) this.ctrVal |= (this.dState[bitOrder[b]] << b);
-        break;
+        if (!valid || bitK === -1) { valid = false; break; }
+        bitOrder[k] = bitK;
+        assigned.add(bitK);
       }
     }
+
+    // Step 3: Verify with 4 cycles using the discovered bit ordering
+    if (valid && assigned.size === n) {
+      for (const i of dffs) this.dState[i] = 0;
+      const vals: number[] = [0];
+      for (let cyc = 0; cyc < 4; cyc++) {
+        tickOnce();
+        let v = 0;
+        for (let b = 0; b < n; b++) v |= (this.dState[bitOrder[b]] << b);
+        vals.push(v);
+      }
+      valid = vals[1] === 1 && vals[2] === 2 && vals[3] === 3 && vals[4] === 4;
+    }
+
+    // Restore state
+    for (let i = 0; i < this.dState.length; i++) this.dState[i] = savedStates[i];
+    this.prevClk = savedClk;
+
+    if (!valid) return false;
+
+    const firstCfg = this.dCfg[dffs[0]];
+    this.ctrDFFs = bitOrder;
+    this.ctrPeriod = 2 ** n;
+    this.ctrRstNet = resetNet ?? this.dR[dffs[0]];
+    this.ctrRstHigh = firstCfg.hasAsyncReset
+      ? firstCfg.asyncResetActiveHigh
+      : firstCfg.syncResetActiveHigh;
+    this.ctrVal = 0;
+    for (let b = 0; b < n; b++) this.ctrVal |= (this.dState[bitOrder[b]] << b);
+    return true;
+  }
+
+  private detectPwmGroups(mod: YosysModule) {
+    const qToDff = new Map<number, number>();
+    for (let i = 0; i < this.dLen; i++) {
+      if (this.dQ[i].length === 1) qToDff.set(this.dQ[i][0], i);
+    }
+
+    const groups = new Map<string, Partial<PwmGroup>>();
+    const getGroup = (prefix: string) => {
+      let group = groups.get(prefix);
+      if (!group) {
+        group = {};
+        groups.set(prefix, group);
+      }
+      return group;
+    };
+
+    for (const [name, net] of Object.entries(mod.netnames)) {
+      if (net.hide_name) continue;
+
+      const regMatch = name.match(/^(.*)\.(pwm_counter|fade_counter|brightness)$/);
+      if (regMatch) {
+        const dffs: number[] = [];
+        let valid = true;
+        for (const bit of net.bits) {
+          if (typeof bit !== 'number') { valid = false; break; }
+          const dff = qToDff.get(bit);
+          if (dff === undefined) { valid = false; break; }
+          dffs.push(dff);
+        }
+        if (!valid) continue;
+
+        const group = getGroup(regMatch[1]);
+        if (regMatch[2] === 'pwm_counter') group.pwmDFFs = dffs;
+        else if (regMatch[2] === 'fade_counter') group.fadeDFFs = dffs;
+        else group.brightnessDFFs = dffs;
+        continue;
+      }
+
+      const outMatch = name.match(/^(.*)\.led_out$/);
+      if (outMatch && net.bits.length === 1 && typeof net.bits[0] === 'number') {
+        getGroup(outMatch[1]).outNet = net.bits[0];
+      }
+    }
+
+    this.pwmGroups = [...groups.values()].filter((group): group is PwmGroup =>
+      !!group.pwmDFFs?.length &&
+      !!group.fadeDFFs?.length &&
+      !!group.brightnessDFFs?.length &&
+      typeof group.outNet === 'number'
+    );
   }
 
   // ─── Internal evaluate (no counter tracking) ───
@@ -621,6 +723,22 @@ export class GateLevelSimulator {
     }
   }
 
+  private evaluateCombinationalOnly(inputs: Record<string, number>): void {
+    const N = this.nets;
+    N.fill(0); N[1] = 1;
+
+    for (const { name, nets } of this.inPorts) {
+      const val = inputs[name] ?? 0;
+      for (let i = 0; i < nets.length; i++) {
+        const idx = nets[i];
+        if (idx >= 2) N[idx] = (val >> i) & 1;
+      }
+    }
+
+    this.outputDFFQ();
+    this.evalComb();
+  }
+
   // ─── Pack outputs from nets ───
   private packOutputs(): Record<string, number> {
     const N = this.nets;
@@ -631,6 +749,83 @@ export class GateLevelSimulator {
       result[name] = val;
     }
     return result;
+  }
+
+  private readCounterValue(ctrDFFs: number[]): number {
+    let val = 0;
+    for (let b = 0; b < ctrDFFs.length; b++) val += this.dState[ctrDFFs[b]] * (2 ** b);
+    return val;
+  }
+
+  private writeCounterValue(dffs: number[], value: number) {
+    for (let b = 0; b < dffs.length; b++) this.dState[dffs[b]] = (value >> b) & 1;
+  }
+
+  private isPwmGroupRunActive(group: PwmGroup, inputs: Record<string, number>): boolean {
+    const savedPwm = this.readCounterValue(group.pwmDFFs);
+    const savedBrightness = this.readCounterValue(group.brightnessDFFs);
+
+    this.writeCounterValue(group.pwmDFFs, 0);
+    this.writeCounterValue(group.brightnessDFFs, 1);
+    this.evaluateCombinationalOnly(inputs);
+    const active = this.nets[group.outNet] === 1;
+
+    this.writeCounterValue(group.pwmDFFs, savedPwm);
+    this.writeCounterValue(group.brightnessDFFs, savedBrightness);
+    this.evaluateCombinationalOnly(inputs);
+    return active;
+  }
+
+  private fastForwardPwmGroups(cycles: number, inputs: Record<string, number>) {
+    if (cycles <= 0 || this.pwmGroups.length === 0) return;
+
+    for (const group of this.pwmGroups) {
+      const pwmPeriod = 2 ** group.pwmDFFs.length;
+      const fadePeriod = 2 ** group.fadeDFFs.length;
+      const maxBrightness = (2 ** group.brightnessDFFs.length) - 1;
+
+      const pwm = this.readCounterValue(group.pwmDFFs);
+      this.writeCounterValue(group.pwmDFFs, (pwm + cycles) % pwmPeriod);
+
+      if (this.isPwmGroupRunActive(group, inputs)) {
+        const fade = this.readCounterValue(group.fadeDFFs);
+        const brightness = this.readCounterValue(group.brightnessDFFs);
+        const firstZeroOffset = (fadePeriod - fade) % fadePeriod;
+        const increments = cycles > firstZeroOffset
+          ? 1 + Math.floor((cycles - firstZeroOffset - 1) / fadePeriod)
+          : 0;
+
+        this.writeCounterValue(group.fadeDFFs, (fade + cycles) % fadePeriod);
+        this.writeCounterValue(group.brightnessDFFs, Math.min(maxBrightness, brightness + increments));
+      } else {
+        this.writeCounterValue(group.fadeDFFs, 0);
+        this.writeCounterValue(group.brightnessDFFs, 0);
+      }
+    }
+
+    this.evaluateCombinationalOnly(inputs);
+  }
+
+  private emitPwmPhaseSamples(inputs: Record<string, number>, onMidCycle?: (result: Record<string, number>) => void) {
+    if (!onMidCycle || this.pwmGroups.length === 0) return;
+
+    const saved = this.pwmGroups.map(group => ({
+      group,
+      pwm: this.readCounterValue(group.pwmDFFs),
+    }));
+
+    const samples = 64;
+    for (let i = 0; i < samples; i++) {
+      for (const { group } of saved) {
+        const period = 2 ** group.pwmDFFs.length;
+        this.writeCounterValue(group.pwmDFFs, Math.floor((i * period) / samples));
+      }
+      this.evaluateCombinationalOnly(inputs);
+      onMidCycle(this.packOutputs());
+    }
+
+    for (const { group, pwm } of saved) this.writeCounterValue(group.pwmDFFs, pwm);
+    this.evaluateCombinationalOnly(inputs);
   }
 
   // ─── Public API: evaluate one half-cycle ───
@@ -672,26 +867,42 @@ export class GateLevelSimulator {
 
     const fastForward = doFastForward ? () => {
       if (remaining <= 1) return;
-      this.ctrVal = 0;
-      for (let b = 0; b < ctrDFFs.length; b++)
-        this.ctrVal |= (this.dState[ctrDFFs[b]] << b);
+      this.ctrVal = this.readCounterValue(ctrDFFs);
       const mask = this.ctrPeriod - 1;
       const toOvf = (mask - this.ctrVal) & mask;
       if (toOvf > 1 && toOvf <= remaining) {
         const skip = toOvf - 1;
         const nv = (this.ctrVal + skip) & mask;
+        this.fastForwardPwmGroups(skip, risingInputs);
         for (let b = 0; b < ctrDFFs.length; b++)
           this.dState[ctrDFFs[b]] = (nv >> b) & 1;
         this.ctrVal = nv;
         remaining -= skip;
       } else if (toOvf > remaining) {
         const nv = (this.ctrVal + remaining) & mask;
+        this.fastForwardPwmGroups(remaining, risingInputs);
         for (let b = 0; b < ctrDFFs.length; b++)
           this.dState[ctrDFFs[b]] = (nv >> b) & 1;
         this.ctrVal = nv;
         remaining = 0;
       }
     } : null;
+
+    const sampleAfterCounterWrap = (beforeCtr: number) => {
+      if (!doFastForward || remaining <= 0) return;
+      const afterCtr = this.readCounterValue(ctrDFFs);
+      if (afterCtr >= beforeCtr) return;
+
+      // A divided-clock FSM just advanced. Simulate a short real burst before
+      // the next skip so child PWM/fade counters can produce visible duty data.
+      const burst = Math.min(remaining, 4096);
+      for (let i = 0; i < burst; i++) {
+        this.evaluateInternal(risingInputs);
+        if (onMidCycle) onMidCycle(this.packOutputs());
+        this.evaluateInternal(fallingInputs);
+        remaining--;
+      }
+    };
 
     // Phase 1: Simulate a sample batch before fast-forward.
     // This gives PWM outputs enough cycles for meaningful duty-cycle
@@ -722,10 +933,12 @@ export class GateLevelSimulator {
     if (toggleCount >= 4) {
       // PWM detected: outputs toggle rapidly — run full batch, no early-break
       while (remaining > 0) {
+        const beforeCtr = doFastForward ? this.readCounterValue(ctrDFFs) : -1;
         this.evaluateInternal(risingInputs);
         if (onMidCycle) onMidCycle(this.packOutputs());
         this.evaluateInternal(fallingInputs);
         remaining--;
+        sampleAfterCounterWrap(beforeCtr);
         if (fastForward) fastForward();
       }
     } else {
@@ -733,6 +946,7 @@ export class GateLevelSimulator {
       let stableCount = 0;
 
       while (remaining > 0) {
+        const beforeCtr = doFastForward ? this.readCounterValue(ctrDFFs) : -1;
         this.evaluateInternal(risingInputs);
         const out = this.packOutputs();
         if (onMidCycle) onMidCycle(out);
@@ -750,10 +964,12 @@ export class GateLevelSimulator {
 
         this.evaluateInternal(fallingInputs);
         remaining--;
+        sampleAfterCounterWrap(beforeCtr);
         if (fastForward) fastForward();
       }
     }
 
+    this.emitPwmPhaseSamples(fallingInputs, onMidCycle);
     return this.packOutputs();
   }
 

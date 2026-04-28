@@ -296,7 +296,18 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
         return next;
       });
 
-      setLedDuty(duty ?? [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+      setLedDuty(prev => {
+        const sampled = duty ?? [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+        return sampled.map((value, i) => {
+          if (value > 0) return value;
+          const prior = prev[i] ?? 0;
+          const binaryOn = (finalOut.led >> i) & 1;
+          if (binaryOn || prior >= 0.98) return 0;
+          // PWM pulses can be narrower than a frame sample; decay instead of
+          // dropping instantly so dim/fading LEDs remain visible.
+          return prior > 0.001 ? prior * 0.85 : 0;
+        });
+      });
     }
 
     // Ongoing: clock continuously — digits appear progressively as
@@ -595,9 +606,10 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
                const binaryOn = (outputs.led >> i) & 1;
                // Use duty cycle for proportional brightness when it's fractional (PWM).
                // Fall back to binary on/off for FSM-type outputs (duty ≈ 0 or ≈ 1).
-               const isPWM = duty > 0.02 && duty < 0.98;
+               const isPWM = duty > 0 && duty < 0.98;
                const brightness = isPWM ? duty : (binaryOn ? 1 : 0);
-               const isOn = powerOn && brightness > 0;
+               const visualBrightness = isPWM ? Math.max(Math.sqrt(duty), 0.18) : brightness;
+               const isOn = powerOn && visualBrightness > 0;
                const ledPortNames = ['U16','E19','U19','V19','W18','U15','U14','V14','V13','V3','W3','U3','P3','N3','P1','L1'];
                return (
                  <Tooltip key={`led-${i}`}>
@@ -611,8 +623,8 @@ export default function Basys3Board({ moduleName, netlist, constraintsSource, is
                              : 'bg-zinc-600/50'
                          }`}
                          style={isOn ? {
-                           boxShadow: `0 0 ${Math.round(8 * brightness)}px rgba(250, 204, 21, ${(brightness * 0.9).toFixed(2)})`,
-                           opacity: Math.max(brightness, 0.15),
+                           boxShadow: `0 0 ${Math.round(8 * visualBrightness)}px rgba(250, 204, 21, ${(visualBrightness * 0.9).toFixed(2)})`,
+                           opacity: Math.max(visualBrightness, 0.15),
                          } : undefined}
                        />
                      </div>
