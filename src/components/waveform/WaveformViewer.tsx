@@ -6,13 +6,23 @@ import {
   v4FormatHex, v4FormatBin, v4FormatDec,
 } from '@/lib/verilog-simulator';
 import { Button } from '@/components/ui/button';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { ZoomIn, ZoomOut, Maximize2, ChevronLeft, ChevronRight, Search, Download } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { ZoomIn, ZoomOut, ChevronLeft, ChevronRight, Download, ChevronDown, Check } from 'lucide-react';
 
 interface WaveformViewerProps {
   simulation: SimulationResult | null;
   selectedSignals?: string[];
 }
+
+type WaveformRow = SignalTrace & {
+  parentName?: string;
+  bitIndex?: number;
+};
 
 const SIGNAL_HEIGHT = 28;
 const LABEL_WIDTH = 200;
@@ -28,8 +38,6 @@ function getThemeColors() {
   const isDark = document.documentElement.classList.contains('dark');
   return {
     bg: isDark ? '#09090b' : '#ffffff',
-    headerBg: isDark ? '#18181b' : '#f4f4f5',
-    headerBorder: isDark ? '#27272a' : '#d4d4d8',
     gridLine: isDark ? '#1f1f23' : '#e4e4e7',
     timeText: isDark ? '#a1a1aa' : '#52525b',
     rowEven: isDark ? '#0c0c0e' : '#fafafa',
@@ -41,12 +49,31 @@ function getThemeColors() {
   };
 }
 
-// Default signal selection: testbench-scope only (one dot in path = top-only)
-function defaultPick(traces: SignalTrace[]): string[] {
-  const top = traces.filter(t => t.name.split('.').length === 2);
-  const internal = traces.filter(t => t.name.split('.').length > 2 || t.isMemory);
-  const picked = [...top.slice(0, 12), ...internal.slice(0, 12)];
-  if (picked.length === 0) return traces.slice(0, 24).map(t => t.name);
+type SignalScopeMode = 'top' | 'all';
+type DisplayMode = 'hex' | 'bin' | 'dec';
+
+const DISPLAY_MODE_LABELS: Record<DisplayMode, string> = {
+  hex: 'Hex',
+  bin: 'Binary',
+  dec: 'Decimal',
+};
+
+const SIGNAL_SCOPE_LABELS: Record<SignalScopeMode, string> = {
+  top: 'Top signals',
+  all: 'All signals',
+};
+
+function isTopScopeSignal(trace: SignalTrace): boolean {
+  return !trace.isMemory && trace.name.split('.').length === 2;
+}
+
+// Default signal selection: testbench/top-scope only, matching Vivado's less noisy default.
+function defaultPick(traces: SignalTrace[], scopeMode: SignalScopeMode): string[] {
+  const candidates = scopeMode === 'top'
+    ? traces.filter(isTopScopeSignal)
+    : traces;
+  const picked = candidates.slice(0, 24);
+  if (picked.length === 0) return traces.filter(t => !t.isMemory).slice(0, 24).map(t => t.name);
   return picked.map(t => t.name);
 }
 
@@ -75,15 +102,37 @@ function valuesEqual(a: V4 | null, b: V4 | null): boolean {
   return a.v === b.v && a.x === b.x;
 }
 
+function bitTrace(parent: SignalTrace, bitIndex: number): WaveformRow {
+  const changes = parent.changes
+    .map(change => ({
+      time: change.time,
+      value: {
+        v: (change.value.v >> BigInt(bitIndex)) & 1n,
+        x: (change.value.x >> BigInt(bitIndex)) & 1n,
+      },
+    }))
+    .filter((change, idx, arr) => idx === 0 || !valuesEqual(change.value, arr[idx - 1].value));
+
+  return {
+    name: `${parent.name}[${bitIndex}]`,
+    parentName: parent.name,
+    bitIndex,
+    width: 1,
+    isMemory: false,
+    changes,
+  };
+}
+
 export default function WaveformViewer({ simulation, selectedSignals }: WaveformViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(1);
   const [scrollX, setScrollX] = useState(0);
   const [cursorTime, setCursorTime] = useState<number | null>(null);
-  const [displayMode, setDisplayMode] = useState<'hex' | 'bin' | 'dec'>('hex');
+  const [displayMode, setDisplayMode] = useState<DisplayMode>('hex');
+  const [signalScopeMode, setSignalScopeMode] = useState<SignalScopeMode>('top');
   const [visibleSignals, setVisibleSignals] = useState<string[]>([]);
-  const [signalFilter, setSignalFilter] = useState('');
+  const [expandedBuses, setExpandedBuses] = useState<Set<string>>(() => new Set());
 
   const allTraces = simulation?.signals ?? EMPTY_TRACES;
   const tracesByName = simulation?.signalsByName ?? EMPTY_TRACE_MAP;
@@ -96,25 +145,38 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
     if (selectedSignals && selectedSignals.length > 0) {
       setVisibleSignals(selectedSignals);
     } else {
-      setVisibleSignals(defaultPick(simulation.signals));
+      setVisibleSignals(defaultPick(simulation.signals, signalScopeMode));
     }
-  }, [simulation, selectedSignals]);
+  }, [simulation, selectedSignals, signalScopeMode]);
 
   const visibleTraces = useMemo(
     () => visibleSignals.map(n => tracesByName[n]).filter(Boolean),
     [visibleSignals, tracesByName]
   );
 
-  const filteredAll = useMemo(() => {
-    const q = signalFilter.trim().toLowerCase();
-    if (!q) return allTraces;
-    return allTraces.filter(t => t.name.toLowerCase().includes(q));
-  }, [allTraces, signalFilter]);
+  const waveformRows = useMemo<WaveformRow[]>(() => {
+    const rows: WaveformRow[] = [];
+    for (const trace of visibleTraces) {
+      rows.push(trace);
+      if (trace.width > 1 && expandedBuses.has(trace.name)) {
+        for (let bit = trace.width - 1; bit >= 0; bit--) {
+          rows.push(bitTrace(trace, bit));
+        }
+      }
+    }
+    return rows;
+  }, [visibleTraces, expandedBuses]);
+
+  const pickerTraces = useMemo(() => {
+    return signalScopeMode === 'top'
+      ? allTraces.filter(isTopScopeSignal)
+      : allTraces;
+  }, [allTraces, signalScopeMode]);
 
   const drawWaveform = useCallback(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
-    if (!canvas || !container || !simulation || visibleTraces.length === 0) {
+    if (!canvas || !container || !simulation || waveformRows.length === 0) {
       if (canvas && container) {
         const dpr = window.devicePixelRatio || 1;
         const tc = getThemeColors();
@@ -139,7 +201,7 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
     const dpr = window.devicePixelRatio || 1;
     const width = container.clientWidth;
     const height = Math.max(
-      HEADER_HEIGHT + visibleTraces.length * SIGNAL_HEIGHT + 8,
+      HEADER_HEIGHT + waveformRows.length * SIGNAL_HEIGHT + 8,
       container.clientHeight
     );
 
@@ -158,9 +220,9 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
     const timeScale = (waveWidth * zoom) / maxTime;
 
     // Header
-    ctx.fillStyle = tc.headerBg;
+    ctx.fillStyle = tc.rowEven;
     ctx.fillRect(0, 0, width, HEADER_HEIGHT);
-    ctx.strokeStyle = tc.headerBorder;
+    ctx.strokeStyle = tc.separator;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, HEADER_HEIGHT + 0.5);
@@ -184,8 +246,8 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
     }
 
     // Each signal
-    for (let idx = 0; idx < visibleTraces.length; idx++) {
-      const trace = visibleTraces[idx];
+    for (let idx = 0; idx < waveformRows.length; idx++) {
+      const trace = waveformRows[idx];
       const y = HEADER_HEIGHT + idx * SIGNAL_HEIGHT;
       const color = COLORS[idx % COLORS.length];
 
@@ -204,9 +266,13 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
       ctx.fillStyle = tc.valueText;
       ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
       ctx.textAlign = 'left';
-      const shortName = trace.name.split('.').slice(1).join('.') || trace.name;
+      const shortName = trace.parentName
+        ? `[${trace.bitIndex}]`
+        : (trace.name.split('.').slice(1).join('.') || trace.name);
       const label = trace.width > 1 ? `${shortName}[${trace.width - 1}:0]` : shortName;
-      ctx.fillText(truncate(label, 24), 8, y + SIGNAL_HEIGHT / 2 + 4);
+      const marker = trace.width > 1 ? (expandedBuses.has(trace.name) ? '▾ ' : '▸ ') : (trace.parentName ? '  ' : '');
+      const labelX = trace.parentName ? 28 : 8;
+      ctx.fillText(truncate(`${marker}${label}`, trace.parentName ? 22 : 24), labelX, y + SIGNAL_HEIGHT / 2 + 4);
 
       // Label/wave separator
       ctx.strokeStyle = tc.labelSep;
@@ -331,7 +397,7 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
         ctx.fillText(`${cursorTime}ns`, cx, HEADER_HEIGHT - 8);
       }
     }
-  }, [simulation, visibleTraces, zoom, scrollX, cursorTime, displayMode]);
+  }, [simulation, waveformRows, zoom, scrollX, cursorTime, displayMode, expandedBuses]);
 
   useEffect(() => { drawWaveform(); }, [drawWaveform]);
 
@@ -351,27 +417,35 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
     if (!simulation || !canvasRef.current) return;
     const rect = canvasRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    if (x < LABEL_WIDTH) return;
+    if (x < LABEL_WIDTH) {
+      const y = e.clientY - rect.top;
+      const rowIndex = Math.floor((y - HEADER_HEIGHT) / SIGNAL_HEIGHT);
+      const row = waveformRows[rowIndex];
+      if (row && row.width > 1 && !row.parentName) {
+        setExpandedBuses(prev => {
+          const next = new Set(prev);
+          if (next.has(row.name)) next.delete(row.name);
+          else next.add(row.name);
+          return next;
+        });
+      }
+      return;
+    }
     const maxTime = Math.max(simulation.duration, 1);
     const waveWidth = rect.width - LABEL_WIDTH;
     const timeScale = (waveWidth * zoom) / maxTime;
     const time = Math.round((x - LABEL_WIDTH + scrollX) / timeScale);
     setCursorTime(Math.max(0, Math.min(time, maxTime)));
-  }, [simulation, zoom, scrollX]);
+  }, [simulation, zoom, scrollX, waveformRows]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
-      const delta = e.deltaY > 0 ? 0.8 : 1.25;
+      const delta = Math.exp(-e.deltaY * 0.002);
       setZoom(z => Math.max(0.1, Math.min(200, z * delta)));
     } else {
       setScrollX(s => Math.max(0, s + e.deltaX + e.deltaY));
     }
-  }, []);
-
-  const zoomToFit = useCallback(() => {
-    setZoom(1);
-    setScrollX(0);
   }, []);
 
   const toggleSignal = useCallback((name: string) => {
@@ -422,9 +496,6 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
         <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setZoom(z => Math.max(0.1, z / 1.5))}>
           <ZoomOut className="h-3.5 w-3.5" />
         </Button>
-        <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={zoomToFit}>
-          <Maximize2 className="h-3.5 w-3.5" />
-        </Button>
         <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setScrollX(s => Math.max(0, s - 100))}>
           <ChevronLeft className="h-3.5 w-3.5" />
         </Button>
@@ -434,16 +505,43 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
 
         <div className="w-px h-4 bg-border" />
 
-        <Select value={displayMode} onValueChange={(v) => setDisplayMode(v as typeof displayMode)}>
-          <SelectTrigger className="h-7 w-24 text-xs">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="hex">Hex</SelectItem>
-            <SelectItem value="bin">Binary</SelectItem>
-            <SelectItem value="dec">Decimal</SelectItem>
-          </SelectContent>
-        </Select>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button variant="outline" size="sm" className="h-7 w-24 justify-between text-xs font-mono bg-background">
+                {DISPLAY_MODE_LABELS[displayMode]}
+                <ChevronDown className="h-3.5 w-3.5 opacity-70" />
+              </Button>
+            }
+          />
+          <DropdownMenuContent align="start" className="w-(--anchor-width)">
+            {(Object.keys(DISPLAY_MODE_LABELS) as DisplayMode[]).map(mode => (
+              <DropdownMenuItem key={mode} onClick={() => setDisplayMode(mode)} className="text-xs">
+                {DISPLAY_MODE_LABELS[mode]}
+                {displayMode === mode && <Check className="ml-auto h-3.5 w-3.5" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button variant="outline" size="sm" className="h-7 w-32 justify-between text-xs font-mono bg-background">
+                {SIGNAL_SCOPE_LABELS[signalScopeMode]}
+                <ChevronDown className="h-3.5 w-3.5 opacity-70" />
+              </Button>
+            }
+          />
+          <DropdownMenuContent align="start" className="w-(--anchor-width)">
+            {(Object.keys(SIGNAL_SCOPE_LABELS) as SignalScopeMode[]).map(mode => (
+              <DropdownMenuItem key={mode} onClick={() => setSignalScopeMode(mode)} className="text-xs">
+                {SIGNAL_SCOPE_LABELS[mode]}
+                {signalScopeMode === mode && <Check className="ml-auto h-3.5 w-3.5" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         {cursorTime !== null && (
           <>
@@ -457,28 +555,16 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
           <Download className="h-3.5 w-3.5" />
         </Button>
         <span className="text-[10px] text-muted-foreground">
-          {simulation.signals.length} signals · {simulation.duration}ns
+          {visibleTraces.length}/{simulation.signals.length} signals · {simulation.duration}ns
         </span>
       </div>
 
       {/* Body: side panel + canvas */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Signal picker */}
+        {/*
         <div className="w-56 border-r border-border bg-muted/20 flex flex-col overflow-hidden">
-          <div className="p-2 border-b border-border">
-            <div className="relative">
-              <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground" />
-              <input
-                type="text"
-                value={signalFilter}
-                onChange={(e) => setSignalFilter(e.target.value)}
-                placeholder="Filter signals…"
-                className="w-full h-7 pl-7 pr-2 text-xs bg-background border border-border rounded outline-none focus:border-primary"
-              />
-            </div>
-          </div>
           <div className="flex-1 overflow-auto text-xs font-mono">
-            {filteredAll.map(t => {
+            {pickerTraces.map(t => {
               const checked = visibleSignals.includes(t.name);
               const cursorVal = cursorTime !== null ? changeAt(t, cursorTime) : null;
               return (
@@ -505,6 +591,7 @@ export default function WaveformViewer({ simulation, selectedSignals }: Waveform
             })}
           </div>
         </div>
+        */}
 
         {/* Canvas */}
         <div
